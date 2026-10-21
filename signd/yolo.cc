@@ -1,0 +1,432 @@
+#include "yolo.h"
+
+#include <onnxruntime_cxx_api.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <fstream>
+#include <map>
+#include <numeric>
+#include <stdexcept>
+
+namespace roadsense {
+namespace signs {
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+double ms_since(Clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+}
+
+// ------------------------------------------------------------ resampling ---
+// Separable triangle-filter resampling with PIL's BILINEAR semantics: for a
+// downscale by s the filter support is widened to s (antialiasing), for an
+// upscale it is plain bilinear. Weights are Q14 fixed point. Taps outside the
+// plane are dropped and the rest renormalised (PIL's edge behaviour).
+
+constexpr int kWBits = 14;
+constexpr int kWOne = 1 << kWBits;
+
+struct Taps {
+    std::vector<int> start, count;
+    std::vector<int16_t> w;  // count[i] weights at i*maxn, Q14
+    std::vector<uint8_t> w7; // the same in Q7 (sum exactly 128) for the uint16 vertical pass
+    int maxn = 0;
+};
+
+void compute_taps(double s0, double len, int src_len, int dst_len, Taps &t) {
+    const double scale = len / dst_len;
+    const double fs = std::max(scale, 1.0);
+    const double support = fs;  // triangle radius 1, scaled
+    t.maxn = int(std::ceil(support)) * 2 + 2;
+    t.start.assign(dst_len, 0);
+    t.count.assign(dst_len, 0);
+    t.w.assign(size_t(dst_len) * t.maxn, 0);
+    t.w7.assign(size_t(dst_len) * t.maxn, 0);
+    std::vector<double> ww(t.maxn);
+    for (int i = 0; i < dst_len; ++i) {
+        const double center = s0 + (i + 0.5) * scale;
+        int xmin = int(std::floor(center - support + 0.5));
+        int xmax = int(std::floor(center + support + 0.5));
+        xmin = std::max(xmin, 0);
+        xmax = std::min(xmax, src_len);
+        if (xmax - xmin > t.maxn) xmax = xmin + t.maxn;
+        if (xmax <= xmin) {  // entirely outside: nearest edge pixel
+            xmin = std::min(std::max(int(std::floor(center)), 0), src_len - 1);
+            xmax = xmin + 1;
+        }
+        double sum = 0;
+        int n = xmax - xmin;
+        for (int k = 0; k < n; ++k) {
+            const double d = std::fabs((xmin + k + 0.5 - center) / fs);
+            ww[k] = d < 1.0 ? 1.0 - d : 0.0;
+            sum += ww[k];
+        }
+        if (sum <= 0) {
+            for (int k = 0; k < n; ++k) ww[k] = 1.0;
+            sum = n;
+        }
+        int isum = 0, kmax = 0;
+        for (int k = 0; k < n; ++k) {
+            const int q = int(std::lround(ww[k] / sum * kWOne));
+            t.w[size_t(i) * t.maxn + k] = int16_t(q);
+            isum += q;
+            if (ww[k] > ww[kmax]) kmax = k;
+        }
+        t.w[size_t(i) * t.maxn + kmax] = int16_t(t.w[size_t(i) * t.maxn + kmax] + (kWOne - isum));
+        int s7 = 0;
+        for (int k = 0; k < n; ++k) {
+            const int q = (t.w[size_t(i) * t.maxn + k] + 64) >> 7;
+            t.w7[size_t(i) * t.maxn + k] = uint8_t(q);
+            s7 += q;
+        }
+        t.w7[size_t(i) * t.maxn + kmax] = uint8_t(t.w7[size_t(i) * t.maxn + kmax] + (128 - s7));
+        t.start[i] = xmin;
+        t.count[i] = n;
+    }
+}
+
+inline uint8_t clamp_u8(int v) { return uint8_t(v < 0 ? 0 : (v > 255 ? 255 : v)); }
+
+// Resamples a plane of nch interleaved channels (1 = Y, 2 = NV12 CbCr) to
+// dw x dh, one uint8 output plane per channel. Vertical pass first: it runs
+// over contiguous bytes (all channels at once, vectorised) and leaves only dh
+// rows for the scalar horizontal pass, which is the cheap order for the large
+// downscale of the detector letterbox. Only the columns the horizontal taps
+// touch are processed, so classifier crops cost only their own area.
+void resample_plane(const uint8_t *src, int stride, int nch, int src_w, int src_h, double sx, double sy, double sw,
+                    double sh, int dw, int dh, uint8_t *const *dst) {
+    thread_local Taps th, tv;
+    thread_local std::vector<uint8_t> tmp;
+    thread_local std::vector<uint16_t> acc;
+    compute_taps(sx, sw, src_w, dw, th);
+    compute_taps(sy, sh, src_h, dh, tv);
+    const int c0 = th.start[0];
+    int c1 = c0;
+    for (int i = 0; i < dw; ++i) c1 = std::max(c1, th.start[i] + th.count[i]);
+    const int rowb = (c1 - c0) * nch;  // bytes per intermediate row
+    if (tmp.size() < size_t(rowb) * dh) tmp.resize(size_t(rowb) * dh);
+    if (acc.size() < size_t(rowb)) acc.resize(size_t(rowb));
+    // Vertical: Q7 weights summing to 128, so 128*255 + 64 fits uint16 and
+    // the loop maps onto 8/16-lane widening multiply-accumulate (NEON umlal).
+    uint16_t *__restrict A = acc.data();
+    for (int j = 0; j < dh; ++j) {
+        for (int i = 0; i < rowb; ++i) A[i] = 64;
+        const uint8_t *w = &tv.w7[size_t(j) * tv.maxn];
+        for (int k = 0; k < tv.count[j]; ++k) {
+            const uint8_t *__restrict row = src + size_t(tv.start[j] + k) * stride + size_t(c0) * nch;
+            const uint16_t wk = w[k];
+            for (int i = 0; i < rowb; ++i) A[i] = uint16_t(A[i] + wk * row[i]);
+        }
+        uint8_t *__restrict o = tmp.data() + size_t(j) * rowb;
+        for (int i = 0; i < rowb; ++i) o[i] = uint8_t(A[i] >> 7);
+    }
+    for (int ch = 0; ch < nch; ++ch) {
+        for (int j = 0; j < dh; ++j) {
+            const uint8_t *row = tmp.data() + size_t(j) * rowb + ch;
+            uint8_t *o = dst[ch] + size_t(j) * dw;
+            for (int i = 0; i < dw; ++i) {
+                const int16_t *w = &th.w[size_t(i) * th.maxn];
+                const uint8_t *p = row + size_t(th.start[i] - c0) * nch;
+                int a = 1 << (kWBits - 1);
+                const int n = th.count[i];
+                for (int k = 0; k < n; ++k) a += w[k] * p[k * nch];
+                o[i] = clamp_u8(a >> kWBits);
+            }
+        }
+    }
+}
+
+float iou(const Detection &a, const Detection &b) {
+    const float ix = std::max(0.f, std::min(a.x1, b.x1) - std::max(a.x0, b.x0));
+    const float iy = std::max(0.f, std::min(a.y1, b.y1) - std::max(a.y0, b.y0));
+    const float inter = ix * iy;
+    const float ua = (a.x1 - a.x0) * (a.y1 - a.y0) + (b.x1 - b.x0) * (b.y1 - b.y0) - inter;
+    return inter / (ua + 1e-9f);
+}
+
+}  // namespace
+
+// ----------------------------------------------------------- image helpers ---
+
+void nv12_region_to_rgb_planar(const Nv12View &src, double sx, double sy, double sw, double sh, int dw, int dh,
+                               float *dst, int dst_w, size_t dst_plane, int dx, int dy) {
+    const size_t n = size_t(dw) * dh;
+    thread_local std::vector<uint8_t> planes;
+    if (planes.size() < 3 * n) planes.resize(3 * n);
+    uint8_t *Y = planes.data(), *U = Y + n, *V = U + n;
+    resample_plane(src.y, src.y_stride, 1, src.width, src.height, sx, sy, sw, sh, dw, dh, &Y);
+    // Chroma sample c covers luma [2c, 2c+2): the same rectangle in chroma pixels is halved.
+    uint8_t *const uvp[2] = {U, V};
+    resample_plane(src.uv, src.uv_stride, 2, src.width / 2, src.height / 2, sx / 2, sy / 2, sw / 2, sh / 2, dw, dh,
+                   uvp);
+    float *R = dst, *G = dst + dst_plane, *B = dst + 2 * dst_plane;
+    constexpr float k = 1.0f / 255.0f;
+    for (int j = 0; j < dh; ++j) {
+        const size_t so = size_t(j) * dw, oo = size_t(dy + j) * dst_w + dx;
+        for (int i = 0; i < dw; ++i) {
+            const float y = Y[so + i], u = float(U[so + i]) - 128.f, v = float(V[so + i]) - 128.f;
+            const float r = y + 1.402f * v, g = y - 0.344136f * u - 0.714136f * v, b = y + 1.772f * u;
+            R[oo + i] = std::min(std::max(r, 0.f), 255.f) * k;
+            G[oo + i] = std::min(std::max(g, 0.f), 255.f) * k;
+            B[oo + i] = std::min(std::max(b, 0.f), 255.f) * k;
+        }
+    }
+}
+
+void nv12_crop(const Nv12View &src, int x0, int y0, int x1, int y1, Nv12Image &out) {
+    x0 = std::max(0, x0) & ~1;
+    y0 = std::max(0, y0) & ~1;
+    x1 = std::min(src.width, (x1 + 1) & ~1);
+    y1 = std::min(src.height, (y1 + 1) & ~1);
+    if (x1 - x0 < 2) x1 = std::min(src.width, x0 + 2);
+    if (y1 - y0 < 2) y1 = std::min(src.height, y0 + 2);
+    out.width = x1 - x0;
+    out.height = y1 - y0;
+    out.data.resize(size_t(out.width) * out.height * 3 / 2);
+    uint8_t *y = out.data.data(), *uv = y + size_t(out.width) * out.height;
+    for (int r = y0; r < y1; ++r)
+        std::copy_n(src.y + size_t(r) * src.y_stride + x0, out.width, y + size_t(r - y0) * out.width);
+    for (int r = y0 / 2; r < y1 / 2; ++r)
+        std::copy_n(src.uv + size_t(r) * src.uv_stride + x0, out.width, uv + size_t(r - y0 / 2) * out.width);
+}
+
+void rgb_to_nv12(const uint8_t *rgb, int width, int height, Nv12Image &out) {
+    const int w = width & ~1, h = height & ~1;
+    out.width = w;
+    out.height = h;
+    out.data.resize(size_t(w) * h * 3 / 2);
+    uint8_t *Y = out.data.data(), *UV = Y + size_t(w) * h;
+    for (int r = 0; r < h; ++r)
+        for (int c = 0; c < w; ++c) {
+            const uint8_t *p = rgb + (size_t(r) * width + c) * 3;
+            Y[size_t(r) * w + c] = clamp_u8(int(std::lround(0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2])));
+        }
+    for (int r = 0; r < h / 2; ++r)
+        for (int c = 0; c < w / 2; ++c) {
+            double R = 0, G = 0, B = 0;
+            for (int dy = 0; dy < 2; ++dy)
+                for (int dx = 0; dx < 2; ++dx) {
+                    const uint8_t *p = rgb + (size_t(2 * r + dy) * width + 2 * c + dx) * 3;
+                    R += p[0];
+                    G += p[1];
+                    B += p[2];
+                }
+            R /= 4;
+            G /= 4;
+            B /= 4;
+            UV[size_t(r) * w + 2 * c] = clamp_u8(int(std::lround(-0.168736 * R - 0.331264 * G + 0.5 * B + 128)));
+            UV[size_t(r) * w + 2 * c + 1] = clamp_u8(int(std::lround(0.5 * R - 0.418688 * G - 0.081312 * B + 128)));
+        }
+}
+
+void nv12_to_rgb(const Nv12View &src, std::vector<uint8_t> &rgb) {
+    rgb.resize(size_t(src.width) * src.height * 3);
+    for (int r = 0; r < src.height; ++r)
+        for (int c = 0; c < src.width; ++c) {
+            const float y = src.y[size_t(r) * src.y_stride + c];
+            const uint8_t *uv = src.uv + size_t(r / 2) * src.uv_stride + (c & ~1);
+            const float u = float(uv[0]) - 128.f, v = float(uv[1]) - 128.f;
+            uint8_t *o = &rgb[(size_t(r) * src.width + c) * 3];
+            o[0] = clamp_u8(int(std::lround(y + 1.402f * v)));
+            o[1] = clamp_u8(int(std::lround(y - 0.344136f * u - 0.714136f * v)));
+            o[2] = clamp_u8(int(std::lround(y + 1.772f * u)));
+        }
+}
+
+std::string strip_variant(const std::string &name) {
+    // Remove a trailing "--g<digits>".
+    const size_t p = name.rfind("--g");
+    if (p == std::string::npos || p + 3 >= name.size()) return name;
+    for (size_t i = p + 3; i < name.size(); ++i)
+        if (name[i] < '0' || name[i] > '9') return name;
+    return name.substr(0, p);
+}
+
+bool ClassNames::load(const std::string &path, std::string *err) {
+    std::ifstream f(path);
+    if (!f) {
+        if (err) *err = "cannot read " + path;
+        return false;
+    }
+    raw.clear();
+    merged.clear();
+    raw_to_merged.clear();
+    merged_to_raw.clear();
+    std::map<std::string, int> idx;
+    std::string line;
+    while (std::getline(f, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        const int id = int(raw.size());
+        raw.push_back(line);
+        const std::string m = strip_variant(line);
+        auto it = idx.find(m);
+        if (it == idx.end()) {
+            it = idx.emplace(m, int(merged.size())).first;
+            merged.push_back(m);
+            merged_to_raw.push_back(id);
+        }
+        raw_to_merged.push_back(it->second);
+    }
+    if (raw.empty()) {
+        if (err) *err = "empty class list " + path;
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- pipeline ---
+
+struct SignPipeline::Ort {
+    ::Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "signd"};
+    ::Ort::MemoryInfo mem = ::Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    std::unique_ptr<::Ort::Session> det, cls;
+    std::string det_in, det_out, cls_in, cls_out;
+    ::Ort::Value det_iv{nullptr}, det_ov{nullptr}, cls_iv{nullptr}, cls_ov{nullptr};
+};
+
+static std::vector<int64_t> io_shape(::Ort::Session &s, bool input) {
+    auto ti = input ? s.GetInputTypeInfo(0) : s.GetOutputTypeInfo(0);
+    return ti.GetTensorTypeAndShapeInfo().GetShape();
+}
+
+SignPipeline::SignPipeline(const PipelineConfig &cfg) : ort_(new Ort), cfg_(cfg) {
+    std::string err;
+    if (!names_.load(cfg.cls_names, &err)) throw std::runtime_error(err);
+    ::Ort::SessionOptions so;
+    so.SetIntraOpNumThreads(cfg.threads);
+    so.SetInterOpNumThreads(1);
+    so.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+    so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    if (!cfg.allow_spinning) so.AddConfigEntry("session.intra_op.allow_spinning", "0");
+    ort_->det = std::make_unique<::Ort::Session>(ort_->env, cfg.det_model.c_str(), so);
+    ort_->cls = std::make_unique<::Ort::Session>(ort_->env, cfg.cls_model.c_str(), so);
+    ::Ort::AllocatorWithDefaultOptions alloc;
+    ort_->det_in = ort_->det->GetInputNameAllocated(0, alloc).get();
+    ort_->det_out = ort_->det->GetOutputNameAllocated(0, alloc).get();
+    ort_->cls_in = ort_->cls->GetInputNameAllocated(0, alloc).get();
+    ort_->cls_out = ort_->cls->GetOutputNameAllocated(0, alloc).get();
+
+    auto di = io_shape(*ort_->det, true), dout = io_shape(*ort_->det, false);
+    auto ci = io_shape(*ort_->cls, true), cout = io_shape(*ort_->cls, false);
+    if (di.size() != 4 || di[1] != 3 || dout.size() != 3 || dout[1] < 5)
+        throw std::runtime_error("unexpected detector I/O shape");
+    if (ci.size() != 4 || ci[1] != 3 || ci[2] != ci[3] || cout.size() != 2)
+        throw std::runtime_error("unexpected classifier I/O shape");
+    in_h_ = int(di[2]);
+    in_w_ = int(di[3]);
+    n_out_ = int(dout[1]);
+    n_anchor_ = int(dout[2]);
+    cls_s_ = int(ci[2]);
+    n_cls_ = int(cout[1]);
+    if (n_cls_ != int(names_.raw.size()))
+        throw std::runtime_error("classifier has " + std::to_string(n_cls_) + " outputs but " + cfg.cls_names +
+                                 " lists " + std::to_string(names_.raw.size()) + " classes");
+    det_in_.assign(size_t(3) * in_w_ * in_h_, 114.f / 255.f);
+    det_out_.assign(size_t(n_out_) * n_anchor_, 0.f);
+    cls_in_.assign(size_t(3) * cls_s_ * cls_s_, 0.f);
+    cls_out_.assign(size_t(n_cls_), 0.f);
+    ort_->det_iv = ::Ort::Value::CreateTensor<float>(ort_->mem, det_in_.data(), det_in_.size(), di.data(), 4);
+    ort_->det_ov = ::Ort::Value::CreateTensor<float>(ort_->mem, det_out_.data(), det_out_.size(), dout.data(), 3);
+    ort_->cls_iv = ::Ort::Value::CreateTensor<float>(ort_->mem, cls_in_.data(), cls_in_.size(), ci.data(), 4);
+    ort_->cls_ov = ::Ort::Value::CreateTensor<float>(ort_->mem, cls_out_.data(), cls_out_.size(), cout.data(), 2);
+}
+
+SignPipeline::~SignPipeline() = default;
+
+void SignPipeline::process(const Nv12View &f, std::vector<Detection> &out, Timing *tm) {
+    out.clear();
+    Timing t;
+    const auto t0 = Clock::now();
+
+    // --- letterbox (geometry exactly as Ultralytics / docs/SIGN_MODELS.md)
+    const double r = std::min(double(in_w_) / f.width, double(in_h_) / f.height);
+    const int nw = int(std::lround(f.width * r)), nh = int(std::lround(f.height * r));
+    const int left = int(std::lround((in_w_ - nw) / 2.0 - 0.1)), top = int(std::lround((in_h_ - nh) / 2.0 - 0.1));
+    const size_t plane = size_t(in_w_) * in_h_;
+    // Padding stays at 114/255 (set once); the image area is fully rewritten.
+    if (nw != lb_w_ || nh != lb_h_) {
+        std::fill(det_in_.begin(), det_in_.end(), 114.f / 255.f);
+        lb_w_ = nw;
+        lb_h_ = nh;
+    }
+    nv12_region_to_rgb_planar(f, 0, 0, f.width, f.height, nw, nh, det_in_.data(), in_w_, plane, left, top);
+    const auto t1 = Clock::now();
+    t.pre_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    // --- detector
+    const char *din = ort_->det_in.c_str(), *dout = ort_->det_out.c_str();
+    ort_->det->Run(::Ort::RunOptions{nullptr}, &din, &ort_->det_iv, 1, &dout, &ort_->det_ov, 1);
+    const auto t2 = Clock::now();
+    t.det_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+
+    // --- decode + NMS
+    std::vector<Detection> cand;
+    const int nc = n_out_ - 4;
+    const float *o = det_out_.data();
+    const size_t N = size_t(n_anchor_);
+    for (size_t i = 0; i < N; ++i) {
+        float best = o[4 * N + i];
+        for (int c = 1; c < nc; ++c) best = std::max(best, o[(4 + c) * N + i]);
+        if (!(best > cfg_.det_thr)) continue;
+        const float cx = o[i], cy = o[N + i], w = o[2 * N + i], h = o[3 * N + i];
+        Detection d;
+        d.x0 = cx - w / 2;
+        d.y0 = cy - h / 2;
+        d.x1 = cx + w / 2;
+        d.y1 = cy + h / 2;
+        d.score = best;
+        cand.push_back(std::move(d));
+    }
+    // Single-class detector: plain greedy NMS (with nc > 1 this is class-agnostic,
+    // which is what a sign tracker wants anyway).
+    std::stable_sort(cand.begin(), cand.end(), [](const Detection &a, const Detection &b) { return a.score > b.score; });
+    std::vector<char> dead(cand.size(), 0);
+    for (size_t i = 0; i < cand.size() && int(out.size()) < cfg_.max_det; ++i) {
+        if (dead[i]) continue;
+        for (size_t j = i + 1; j < cand.size(); ++j)
+            if (!dead[j] && iou(cand[i], cand[j]) > cfg_.nms_iou) dead[j] = 1;
+        Detection d = cand[i];
+        const float W = float(f.width), H = float(f.height);
+        auto mx = [&](float x) { return std::min(std::max(float((x - left) / r), 0.f), W); };
+        auto my = [&](float y) { return std::min(std::max(float((y - top) / r), 0.f), H); };
+        d.x0 = mx(d.x0);
+        d.x1 = mx(d.x1);
+        d.y0 = my(d.y0);
+        d.y1 = my(d.y1);
+        if (d.x1 - d.x0 < cfg_.min_box_px || d.y1 - d.y0 < cfg_.min_box_px) continue;
+        out.push_back(std::move(d));
+    }
+    const auto t3 = Clock::now();
+    t.post_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+
+    // --- classifier per box
+    const char *cin = ort_->cls_in.c_str(), *cout = ort_->cls_out.c_str();
+    const size_t cplane = size_t(cls_s_) * cls_s_;
+    for (Detection &d : out) {
+        const double bw = d.x1 - d.x0, bh = d.y1 - d.y0, m = cfg_.cls_margin;
+        double x0 = std::max(0.0, d.x0 - m * bw), y0 = std::max(0.0, d.y0 - m * bh);
+        double x1 = std::min(double(f.width), d.x1 + m * bw), y1 = std::min(double(f.height), d.y1 + m * bh);
+        const double w = x1 - x0, h = y1 - y0;
+        // Ultralytics classify transform: short side -> S, centre crop S x S.
+        const double s = cls_s_ / std::min(w, h);
+        const int rw = std::max(cls_s_, int(std::lround(w * s))), rh = std::max(cls_s_, int(std::lround(h * s)));
+        const int l = (rw - cls_s_) / 2, tp = (rh - cls_s_) / 2;
+        const double sxs = w / rw, sys = h / rh;  // source px per resized px
+        nv12_region_to_rgb_planar(f, x0 + l * sxs, y0 + tp * sys, cls_s_ * sxs, cls_s_ * sys, cls_s_, cls_s_,
+                                  cls_in_.data(), cls_s_, cplane, 0, 0);
+        ort_->cls->Run(::Ort::RunOptions{nullptr}, &cin, &ort_->cls_iv, 1, &cout, &ort_->cls_ov, 1);
+        const int k = int(std::max_element(cls_out_.begin(), cls_out_.end()) - cls_out_.begin());
+        d.cls_raw = k;
+        d.cls_prob = cls_out_[size_t(k)];
+        d.probs = cls_out_;
+    }
+    t.cls_ms = ms_since(t3);
+    t.total_ms = ms_since(t0);
+    if (tm) *tm = t;
+}
+
+}  // namespace signs
+}  // namespace roadsense

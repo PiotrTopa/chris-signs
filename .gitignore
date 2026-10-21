@@ -1,0 +1,9 @@
+build/
+# sign models: no licence on the weights, never committed (scripts/fetch-models.sh exports them locally)
+models/*.onnx
+models/*.txt
+models/src/
+*.pt
+.venv-export/
+__pycache__/
+*.pyc

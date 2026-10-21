@@ -1,0 +1,22 @@
+[Unit]
+Description=roadsense signd (traffic-sign detector + tracker)
+PartOf=roadsense.target
+After=roadsense-camerad.service
+Wants=roadsense-camerad.service
+
+[Service]
+Type=simple
+# Phase 1: root. The frame ring lives in /dev/shm and logind would remove a
+# normal user's shm segments at logout (RemoveIPC); a system user comes later.
+Environment=ROADSENSE_RUNDIR=/run/roadsense
+Environment=ROADSENSE_CONFIG_DIR=/etc/roadsense
+RuntimeDirectory=roadsense
+RuntimeDirectoryPreserve=yes
+StateDirectory=roadsense
+ExecStart=/usr/local/bin/signd
+Restart=always
+RestartSec=2
+Nice=-5
+
+[Install]
+WantedBy=roadsense.target

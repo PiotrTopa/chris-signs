@@ -13,7 +13,7 @@ Environment=ROADSENSE_CONFIG_DIR=/etc/roadsense
 RuntimeDirectory=roadsense
 RuntimeDirectoryPreserve=yes
 StateDirectory=roadsense
-ExecStart=/usr/local/bin/signd
+ExecStart=/usr/local/bin/signd --cpus 4-7 --threads 4 --stats 10
 Restart=always
 RestartSec=2
 Nice=-5

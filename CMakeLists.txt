@@ -1,5 +1,9 @@
 # roadsense-signs: MTSD traffic-sign detector + classifier + SORT tracker (signd) and its
-# offline replay tool (signd_replay), on ONNX Runtime (CPU).
+# offline replay tool (signd_replay), on ONNX Runtime (CPU) and optionally ncnn (Vulkan).
+#
+# ncnn backend (--backend ncnn): -DROADSENSE_NCNN=ON plus either
+#   -DNCNN_DIR=/path/to/ncnn   an ncnn source tree built in <NCNN_DIR>/build (roadsense scripts/build-ncnn.sh)
+#   (no NCNN_DIR)              an installed ncnn found by find_package(ncnn)
 #
 # Builds against the IPC headers of a roadsense checkout (MIT, header-only, no linking):
 #   camerad/ring.h       frame-ring reader
@@ -47,10 +51,42 @@ if(NOT SIGND_ORT_INCLUDE_DIR OR NOT SIGND_ORT_LIBRARY)
   message(FATAL_ERROR "onnxruntime not found (set ONNXRUNTIME_ROOT)")
 endif()
 
-add_library(signd_core STATIC signd/yolo.cc signd/tracker.cc signd/output.cc)
+add_library(signd_core STATIC signd/yolo.cc signd/ort_runner.cc signd/tracker.cc signd/output.cc)
 target_include_directories(signd_core PUBLIC ${CMAKE_SOURCE_DIR}/signd ${ROADSENSE_DIR}/camerad
   ${SIGND_ORT_INCLUDE_DIR})
 target_link_libraries(signd_core PUBLIC ${SIGND_ORT_LIBRARY})
+
+option(ROADSENSE_NCNN "Build the ncnn (Vulkan) inference backend" OFF)
+set(NCNN_DIR "$ENV{NCNN_DIR}" CACHE PATH "ncnn source tree with a build in <NCNN_DIR>/build (empty: find_package(ncnn))")
+if(ROADSENSE_NCNN)
+  target_sources(signd_core PRIVATE signd/ncnn_runner.cc)
+  target_compile_definitions(signd_core PUBLIC ROADSENSE_HAVE_NCNN)
+  if(NCNN_DIR)
+    set(_nb ${NCNN_DIR}/build)
+    if(NOT EXISTS ${_nb}/src/libncnn.a)
+      message(FATAL_ERROR "NCNN_DIR=${NCNN_DIR}: ${_nb}/src/libncnn.a not found")
+    endif()
+    find_package(OpenMP REQUIRED)
+    target_include_directories(signd_core SYSTEM PRIVATE ${NCNN_DIR}/src ${_nb}/src)
+    # Same static link group as roadsense modeld/CMakeLists.txt.
+    target_link_libraries(signd_core PUBLIC
+      ${_nb}/src/libncnn.a
+      -Wl,--start-group
+      ${_nb}/glslang/SPIRV/libSPIRV.a
+      ${_nb}/glslang/glslang/libglslang.a
+      ${_nb}/glslang/glslang/libMachineIndependent.a
+      ${_nb}/glslang/glslang/libGenericCodeGen.a
+      ${_nb}/glslang/glslang/OSDependent/Unix/libOSDependent.a
+      ${_nb}/glslang/glslang/libglslang-default-resource-limits.a
+      -Wl,--end-group
+      OpenMP::OpenMP_CXX Threads::Threads ${CMAKE_DL_LIBS})
+    message(STATUS "signd: ncnn backend from ${NCNN_DIR}")
+  else()
+    find_package(ncnn REQUIRED)
+    target_link_libraries(signd_core PUBLIC ncnn)
+    message(STATUS "signd: ncnn backend from installed ncnn (${ncnn_DIR})")
+  endif()
+endif()
 if(ONNXRUNTIME_ROOT)
   set_target_properties(signd_core PROPERTIES INTERFACE_LINK_OPTIONS "-Wl,-rpath,${ONNXRUNTIME_ROOT}/lib")
 endif()

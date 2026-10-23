@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include "runner.h"
+
 namespace roadsense {
 namespace signs {
 
@@ -45,10 +47,19 @@ struct Nv12Image {
 };
 
 struct PipelineConfig {
-    std::string det_model = "/var/lib/roadsense/models/mtsd_signdet_yolov8n_384x640.onnx";
-    std::string cls_model = "/var/lib/roadsense/models/mtsd_signcls_yolov8n_64.onnx";
-    std::string cls_names = "/var/lib/roadsense/models/mtsd_signcls_classes.txt";
-    int threads = 4;           // ORT intra-op threads (both sessions)
+    // Backends per model (runner.h): "ort" (ONNX Runtime CPU, the reference) or "ncnn" (Vulkan).
+    // Empty model paths resolve to the default file names for the backend in models_dir
+    // (ort: mtsd_signdet_yolov8n_384x640.onnx / mtsd_signcls_yolov8n_64.onnx, ncnn: the same
+    // stems with -ncnn.param), see default_model_path().
+    std::string det_backend = "ort", cls_backend = "ort";
+    std::string models_dir = "/var/lib/roadsense/models";
+    std::string det_model, cls_model;
+    std::string cls_names;     // default models_dir/mtsd_signcls_classes.txt
+    int threads = 4;           // ORT intra-op threads (both sessions); ncnn CPU threads
+    bool ncnn_fp16 = true;     // ncnn: fp16-packed storage (false: GPU fp32, several times slower)
+    bool ncnn_flushall = true; // ncnn: add TU_DEBUG=flushall for turnip (see runner.h)
+    // Model geometry: ORT checks these against the graph, ncnn (no shapes in .param) relies on them.
+    int det_w = 640, det_h = 384, cls_size = 64;
     float det_thr = 0.35f;     // detector score threshold (strictly greater)
     float cls_gate = 0.6f;     // classifier top-1 probability needed for a class vote
     float nms_iou = 0.45f;
@@ -60,6 +71,9 @@ struct PipelineConfig {
     // A75: 183 vs 145 ms, 4 threads) and burns cores camerad shares.
     bool allow_spinning = false;
 };
+
+// models_dir/<default file name> for a model ("det" or "cls") on a backend.
+std::string default_model_path(const std::string &models_dir, const std::string &which, const std::string &backend);
 
 struct Detection {
     float x0, y0, x1, y1;   // frame pixels
@@ -94,13 +108,14 @@ public:
     void process(const Nv12View &frame, std::vector<Detection> &out, Timing *t = nullptr);
 
     const ClassNames &names() const { return names_; }
-    const PipelineConfig &config() const { return cfg_; }
+    const PipelineConfig &config() const { return cfg_; }  // with the model paths resolved
     int input_w() const { return in_w_; }
     int input_h() const { return in_h_; }
+    const char *det_backend() const { return det_->name(); }
+    const char *cls_backend() const { return cls_->name(); }
 
 private:
-    struct Ort;
-    std::unique_ptr<Ort> ort_;
+    std::unique_ptr<ModelRunner> det_, cls_;
     PipelineConfig cfg_;
     ClassNames names_;
     int lb_w_ = -1, lb_h_ = -1;  // letterbox content size of the last frame

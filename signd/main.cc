@@ -1,5 +1,5 @@
 // signd: camera frame ring -> MTSD sign detector + classifier (ONNX Runtime
-// CPU) -> SORT tracker -> `signs` JSON lines on <rundir>/signd.sock and best
+// CPU, or ncnn/Vulkan with --backend ncnn) -> SORT tracker -> `signs` JSON lines on <rundir>/signd.sock and best
 // crops in <rundir>/crops/<track_id>.jpg. Contract: roadsense docs/ARCHITECTURE.md,
 // models and pre/post-processing: docs/SIGN_MODELS.md.
 //
@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <sys/resource.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -44,6 +45,7 @@ struct Options {
     size_t max_crops = 500;
     uint64_t max_frames = 0;
     double stats_s = 10;
+    double max_hz = 0;  // 0 = as fast as the pipeline goes
     bool timing = false;
     bool verbose = false;
 };
@@ -113,20 +115,18 @@ bool parse_cpus(const std::string &s, cpu_set_t *set) {
     return n > 0;
 }
 
-void set_models_dir(PipelineConfig &pc, const std::string &d) {
-    pc.det_model = d + "/mtsd_signdet_yolov8n_384x640.onnx";
-    pc.cls_model = d + "/mtsd_signcls_yolov8n_64.onnx";
-    pc.cls_names = d + "/mtsd_signcls_classes.txt";
-}
-
 void usage() {
     fprintf(stderr,
             "usage: signd [options]\n"
+            "  --backend B       ort: ONNX Runtime on the CPU (default); ncnn: ncnn on the GPU through Vulkan (if built in)\n"
+            "  --det-backend B, --cls-backend B   per-model override (e.g. detector on ncnn, classifier on ort)\n"
             "  --models-dir DIR  directory with the default model file names (default /var/lib/roadsense/models)\n"
-            "  --det PATH        detector ONNX (mtsd_signdet_yolov8n_384x640.onnx)\n"
-            "  --cls PATH        classifier ONNX (mtsd_signcls_yolov8n_64.onnx)\n"
+            "  --det PATH        detector: ort mtsd_signdet_yolov8n_384x640.onnx, ncnn ...-ncnn.param (weights: .bin next to it)\n"
+            "  --cls PATH        classifier: ort mtsd_signcls_yolov8n_64.onnx, ncnn ...-ncnn.param\n"
             "  --cls-names PATH  classifier class list (mtsd_signcls_classes.txt)\n"
-            "  --threads N       ORT intra-op threads (default 4)\n"
+            "  --threads N       ORT intra-op threads (default 4; ncnn needs none, use 1)\n"
+            "  --ncnn-fp32       ncnn: disable fp16 packing (GPU fp32, several times slower)\n"
+            "  --ncnn-no-flushall  ncnn: do not add TU_DEBUG=flushall (turnip needs it for correct results)\n"
             "  --cpus LIST       CPU affinity, e.g. 0-3 or 4-7 or 0,1 (default 0-3 = A55 cluster; none = no pinning)\n"
             "  --nice N          setpriority nice value (default 0)\n"
             "  --spin            let ORT threads busy-wait between ops (default off: slower on the SD845)\n"
@@ -139,13 +139,14 @@ void usage() {
             "  --iou-match X     tracker: min IoU to associate (default 0.1)\n"
             "  --crop-margin X   relative margin of the saved best crop (default 0.15)\n"
             "  --max-crops N     keep at most N crop files written by this process (default 500, 0 = unlimited)\n"
+            "  --max-hz X        process at most X frames/s (duty cycle; default 0 = as fast as possible)\n"
             "  --timing          add a non-contract \"timing\" object to every message\n"
             "  --frames N        exit after N processed frames (testing)\n"
             "  --stats S         stderr stats interval in s (default 10, 0 = off)\n"
             "  --verbose\n"
-            "config: $ROADSENSE_CONFIG_DIR (default /etc/roadsense)/signd.json, keys models_dir, det_model,\n"
-            "        cls_model, cls_names, threads, cpus, nice, spin, det_thr, cls_gate, nms_iou, cls_margin,\n"
-            "        max_age, min_hits, iou_match, crop_margin, max_crops (CLI wins)\n"
+            "config: $ROADSENSE_CONFIG_DIR (default /etc/roadsense)/signd.json, keys backend, det_backend, cls_backend,\n"
+            "        models_dir, det_model, cls_model, cls_names, threads, cpus, nice, spin, ncnn_fp16, ncnn_flushall,\n"
+            "        det_thr, cls_gate, nms_iou, cls_margin, max_age, min_hits, iou_match, crop_margin, max_crops, max_hz (CLI wins)\n"
             "env: ROADSENSE_RUNDIR (default /run/roadsense), ROADSENSE_RING (default /dev/shm/roadsense-frames)\n");
 }
 
@@ -154,7 +155,10 @@ void load_config(Options &o) {
     if (!read_file(config_dir() + "/signd.json", &s)) return;
     double v;
     std::string str;
-    if (json_string(s, "models_dir", &str)) set_models_dir(o.pc, str);
+    if (json_string(s, "backend", &str)) o.pc.det_backend = o.pc.cls_backend = str;
+    if (json_string(s, "det_backend", &str)) o.pc.det_backend = str;
+    if (json_string(s, "cls_backend", &str)) o.pc.cls_backend = str;
+    if (json_string(s, "models_dir", &str)) o.pc.models_dir = str;
     if (json_string(s, "det_model", &str)) o.pc.det_model = str;
     if (json_string(s, "cls_model", &str)) o.pc.cls_model = str;
     if (json_string(s, "cls_names", &str)) o.pc.cls_names = str;
@@ -162,6 +166,8 @@ void load_config(Options &o) {
     if (json_string(s, "cpus", &str)) o.cpus = str;
     if (json_number(s, "nice", &v)) o.nice = int(v);
     if (json_number(s, "spin", &v)) o.pc.allow_spinning = v != 0;
+    if (json_number(s, "ncnn_fp16", &v)) o.pc.ncnn_fp16 = v != 0;
+    if (json_number(s, "ncnn_flushall", &v)) o.pc.ncnn_flushall = v != 0;
     if (json_number(s, "det_thr", &v)) o.pc.det_thr = float(v);
     if (json_number(s, "cls_gate", &v)) o.pc.cls_gate = o.tc.cls_gate = float(v);
     if (json_number(s, "nms_iou", &v)) o.pc.nms_iou = float(v);
@@ -171,6 +177,7 @@ void load_config(Options &o) {
     if (json_number(s, "iou_match", &v)) o.tc.iou_match = float(v);
     if (json_number(s, "crop_margin", &v)) o.tc.crop_margin = float(v);
     if (json_number(s, "max_crops", &v)) o.max_crops = size_t(v);
+    if (json_number(s, "max_hz", &v)) o.max_hz = v;
 }
 
 }  // namespace
@@ -187,7 +194,12 @@ int main(int argc, char **argv) {
             }
             return argv[++i];
         };
-        if (a == "--models-dir") set_models_dir(opt.pc, val());
+        if (a == "--backend") opt.pc.det_backend = opt.pc.cls_backend = val();
+        else if (a == "--det-backend") opt.pc.det_backend = val();
+        else if (a == "--cls-backend") opt.pc.cls_backend = val();
+        else if (a == "--models-dir") opt.pc.models_dir = val();
+        else if (a == "--ncnn-fp32") opt.pc.ncnn_fp16 = false;
+        else if (a == "--ncnn-no-flushall") opt.pc.ncnn_flushall = false;
         else if (a == "--det") opt.pc.det_model = val();
         else if (a == "--cls") opt.pc.cls_model = val();
         else if (a == "--cls-names") opt.pc.cls_names = val();
@@ -205,6 +217,7 @@ int main(int argc, char **argv) {
         else if (a == "--iou-match") opt.tc.iou_match = float(atof(val().c_str()));
         else if (a == "--crop-margin") opt.tc.crop_margin = float(atof(val().c_str()));
         else if (a == "--max-crops") opt.max_crops = size_t(atol(val().c_str()));
+        else if (a == "--max-hz") opt.max_hz = atof(val().c_str());
         else if (a == "--timing") opt.timing = true;
         else if (a == "--frames") opt.max_frames = strtoull(val().c_str(), nullptr, 10);
         else if (a == "--stats") opt.stats_s = atof(val().c_str());
@@ -241,9 +254,10 @@ int main(int argc, char **argv) {
         return 1;
     }
     fprintf(stderr,
-            "signd: detector %dx%d, %zu classes (%zu merged), %d threads on cpus %s, det_thr %.2f cls_gate %.2f "
-            "nms %.2f\n",
-            pipe->input_w(), pipe->input_h(), pipe->names().raw.size(), pipe->names().merged.size(), opt.pc.threads,
+            "signd: detector %dx%d on %s (%s), classifier on %s (%s), %zu classes (%zu merged), %d threads on cpus %s, "
+            "det_thr %.2f cls_gate %.2f nms %.2f\n",
+            pipe->input_w(), pipe->input_h(), pipe->det_backend(), pipe->config().det_model.c_str(), pipe->cls_backend(),
+            pipe->config().cls_model.c_str(), pipe->names().raw.size(), pipe->names().merged.size(), opt.pc.threads,
             opt.cpus.c_str(), opt.pc.det_thr, opt.pc.cls_gate, opt.pc.nms_iou);
 
     if (!mkdir_p(rundir)) {
@@ -272,6 +286,7 @@ int main(int argc, char **argv) {
     uint64_t stats_n = 0;
     double stats_ms = 0, stats_det = 0;
     FrameMeta last_meta;
+    auto next_allowed = Clock::now();
 
     auto publish = [&](const FrameMeta &m, double ms, const Timing *t) {
         crop_paths.clear();
@@ -289,10 +304,19 @@ int main(int argc, char **argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             continue;
         }
+        if (opt.max_hz > 0) {  // duty cycle: wait out the period, then take the newest frame
+            const auto now = Clock::now();
+            if (now < next_allowed) {
+                srv.service();
+                std::this_thread::sleep_for(std::min(next_allowed - now, std::chrono::steady_clock::duration(std::chrono::milliseconds(20))));
+                continue;
+            }
+        }
         if (!rr.next(fv, 200)) {
             srv.service();
             continue;
         }
+        if (opt.max_hz > 0) next_allowed = Clock::now() + std::chrono::microseconds(int64_t(1e6 / opt.max_hz));
         if (fv.seq < last_seq) {  // camerad restarted: the old tracks cannot continue
             reports.clear();
             ended.clear();

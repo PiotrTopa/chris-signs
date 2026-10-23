@@ -15,7 +15,13 @@ RuntimeDirectoryPreserve=yes
 StateDirectory=roadsense
 # Wait for camerad's frame ring (its unit is 'started' before the ring exists).
 ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/shm/roadsense-frames ] && exit 0; sleep 1; done; exit 0'
-ExecStart=/usr/local/bin/signd --cpus 4-7 --threads 4 --stats 10
+# Detector on the GPU (ncnn/Vulkan), classifier on ORT with 2 threads, CPU side on the big cores
+# (otherwise idle next to modeld on the GPU), capped at 5 frames/s so modeld keeps >= 9 road
+# messages/s: ~5 signs/s at ~68 C instead of 5.6 signs/s at 94 C+ on four A75s (ORT 4 threads).
+# Uncapped (no --max-hz) gives 8.7 signs/s and 8.7 road/s at ~72 C. Measurements: roadsense
+# docs/lanes/L1-signs-vulkan.md (2026-10-24). Needs the ncnn build (scripts/install-phone.sh with
+# NCNN_DIR) and the *-ncnn models; `--backend ort --threads 4` is the CPU fallback.
+ExecStart=/usr/local/bin/signd --det-backend ncnn --cls-backend ort --threads 2 --cpus 4-7 --max-hz 5 --stats 10
 Restart=always
 RestartSec=2
 Nice=-5

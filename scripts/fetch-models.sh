@@ -9,6 +9,7 @@
 # .pt or .onnx files (.gitignore keeps them out).
 #
 #   scripts/fetch-models.sh            # download + scan + export (skips steps already done)
+#   NCNN=0 scripts/fetch-models.sh     # skip the ncnn (Vulkan) conversion, see below
 #   PYTHON=python3.12 scripts/fetch-models.sh
 #   ULTRALYTICS_VERSION=... TORCH_VERSION=... scripts/fetch-models.sh   # override the tested pins
 set -eu
@@ -65,4 +66,19 @@ for path, (i, o) in want.items():
         sys.exit(1)
 PY
 [ "$(wc -l < models/mtsd_signcls_classes.txt)" = 400 ] || { echo "classifier class list is not 400 lines"; exit 1; }
-sha256sum models/*.onnx models/*.txt
+
+# ncnn (Vulkan) models for `signd --backend ncnn`: onnxsim + pnnx + tools/ncnn/fix_ncnn.py, see
+# tools/ncnn/make_ncnn.sh. pnnx links against torch; the conversion venv is roadsense's
+# .venv-models (NCNN_VENV, default ../roadsense/.venv-models, created by roadsense scripts/fetch-models.sh;
+# a fresh one needs: pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu,
+# then onnx==1.23.2 onnxsim==0.8.1 pnnx==20261020 numpy). Skip with NCNN=0.
+if [ "${NCNN:-1}" != 0 ] && { [ ! -f models/mtsd_signdet_yolov8n_384x640-ncnn.param ] || [ ! -f models/mtsd_signcls_yolov8n_64-ncnn.param ]; }; then
+    NCNN_VENV=${NCNN_VENV:-../roadsense/.venv-models}
+    if [ ! -x "$NCNN_VENV/bin/pnnx" ]; then
+        "$PYTHON" -m venv "$NCNN_VENV"
+        "$NCNN_VENV/bin/pip" -q install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
+        "$NCNN_VENV/bin/pip" -q install onnx==1.23.2 onnxsim==0.8.1 pnnx==20261020 numpy
+    fi
+    tools/ncnn/make_ncnn.sh models "$NCNN_VENV"
+fi
+sha256sum models/*.onnx models/*.txt models/*-ncnn.param models/*-ncnn.bin 2>/dev/null

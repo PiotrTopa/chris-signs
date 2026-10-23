@@ -1,7 +1,5 @@
 #include "yolo.h"
 
-#include <onnxruntime_cxx_api.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -279,59 +277,45 @@ bool ClassNames::load(const std::string &path, std::string *err) {
 
 // ---------------------------------------------------------------- pipeline ---
 
-struct SignPipeline::Ort {
-    ::Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "signd"};
-    ::Ort::MemoryInfo mem = ::Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-    std::unique_ptr<::Ort::Session> det, cls;
-    std::string det_in, det_out, cls_in, cls_out;
-    ::Ort::Value det_iv{nullptr}, det_ov{nullptr}, cls_iv{nullptr}, cls_ov{nullptr};
-};
-
-static std::vector<int64_t> io_shape(::Ort::Session &s, bool input) {
-    auto ti = input ? s.GetInputTypeInfo(0) : s.GetOutputTypeInfo(0);
-    return ti.GetTensorTypeAndShapeInfo().GetShape();
+std::string default_model_path(const std::string &models_dir, const std::string &which, const std::string &backend) {
+    const std::string stem = which == "det" ? "mtsd_signdet_yolov8n_384x640" : "mtsd_signcls_yolov8n_64";
+    return models_dir + "/" + stem + (backend == "ncnn" ? "-ncnn.param" : ".onnx");
 }
 
-SignPipeline::SignPipeline(const PipelineConfig &cfg) : ort_(new Ort), cfg_(cfg) {
+SignPipeline::SignPipeline(const PipelineConfig &cfg) : cfg_(cfg) {
+    if (cfg_.det_model.empty()) cfg_.det_model = default_model_path(cfg_.models_dir, "det", cfg_.det_backend);
+    if (cfg_.cls_model.empty()) cfg_.cls_model = default_model_path(cfg_.models_dir, "cls", cfg_.cls_backend);
+    if (cfg_.cls_names.empty()) cfg_.cls_names = cfg_.models_dir + "/mtsd_signcls_classes.txt";
     std::string err;
-    if (!names_.load(cfg.cls_names, &err)) throw std::runtime_error(err);
-    ::Ort::SessionOptions so;
-    so.SetIntraOpNumThreads(cfg.threads);
-    so.SetInterOpNumThreads(1);
-    so.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
-    so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-    if (!cfg.allow_spinning) so.AddConfigEntry("session.intra_op.allow_spinning", "0");
-    ort_->det = std::make_unique<::Ort::Session>(ort_->env, cfg.det_model.c_str(), so);
-    ort_->cls = std::make_unique<::Ort::Session>(ort_->env, cfg.cls_model.c_str(), so);
-    ::Ort::AllocatorWithDefaultOptions alloc;
-    ort_->det_in = ort_->det->GetInputNameAllocated(0, alloc).get();
-    ort_->det_out = ort_->det->GetOutputNameAllocated(0, alloc).get();
-    ort_->cls_in = ort_->cls->GetInputNameAllocated(0, alloc).get();
-    ort_->cls_out = ort_->cls->GetOutputNameAllocated(0, alloc).get();
+    if (!names_.load(cfg_.cls_names, &err)) throw std::runtime_error(err);
+    in_w_ = cfg_.det_w;
+    in_h_ = cfg_.det_h;
+    cls_s_ = cfg_.cls_size;
+    n_cls_ = int(names_.raw.size());
+    n_out_ = 4 + 1;  // cx, cy, w, h, one class score (single-class detector)
+    n_anchor_ = 0;
+    for (int s : {8, 16, 32}) n_anchor_ += (in_w_ / s) * (in_h_ / s);
 
-    auto di = io_shape(*ort_->det, true), dout = io_shape(*ort_->det, false);
-    auto ci = io_shape(*ort_->cls, true), cout = io_shape(*ort_->cls, false);
-    if (di.size() != 4 || di[1] != 3 || dout.size() != 3 || dout[1] < 5)
-        throw std::runtime_error("unexpected detector I/O shape");
-    if (ci.size() != 4 || ci[1] != 3 || ci[2] != ci[3] || cout.size() != 2)
-        throw std::runtime_error("unexpected classifier I/O shape");
-    in_h_ = int(di[2]);
-    in_w_ = int(di[3]);
-    n_out_ = int(dout[1]);
-    n_anchor_ = int(dout[2]);
-    cls_s_ = int(ci[2]);
-    n_cls_ = int(cout[1]);
-    if (n_cls_ != int(names_.raw.size()))
-        throw std::runtime_error("classifier has " + std::to_string(n_cls_) + " outputs but " + cfg.cls_names +
-                                 " lists " + std::to_string(names_.raw.size()) + " classes");
+    RunnerOptions ro;
+    ro.threads = cfg_.threads;
+    ro.allow_spinning = cfg_.allow_spinning;
+    ro.ncnn_fp16 = cfg_.ncnn_fp16;
+    ro.ncnn_flushall = cfg_.ncnn_flushall;
+    ro.backend = cfg_.det_backend;
+    ro.model = cfg_.det_model;
+    ro.input_shape = {1, 3, in_h_, in_w_};
+    ro.output_size = size_t(n_out_) * n_anchor_;
+    det_ = make_runner(ro);
+    ro.backend = cfg_.cls_backend;
+    ro.model = cfg_.cls_model;
+    ro.input_shape = {1, 3, cls_s_, cls_s_};
+    ro.output_size = size_t(n_cls_);
+    cls_ = make_runner(ro);
+
     det_in_.assign(size_t(3) * in_w_ * in_h_, 114.f / 255.f);
     det_out_.assign(size_t(n_out_) * n_anchor_, 0.f);
     cls_in_.assign(size_t(3) * cls_s_ * cls_s_, 0.f);
     cls_out_.assign(size_t(n_cls_), 0.f);
-    ort_->det_iv = ::Ort::Value::CreateTensor<float>(ort_->mem, det_in_.data(), det_in_.size(), di.data(), 4);
-    ort_->det_ov = ::Ort::Value::CreateTensor<float>(ort_->mem, det_out_.data(), det_out_.size(), dout.data(), 3);
-    ort_->cls_iv = ::Ort::Value::CreateTensor<float>(ort_->mem, cls_in_.data(), cls_in_.size(), ci.data(), 4);
-    ort_->cls_ov = ::Ort::Value::CreateTensor<float>(ort_->mem, cls_out_.data(), cls_out_.size(), cout.data(), 2);
 }
 
 SignPipeline::~SignPipeline() = default;
@@ -357,8 +341,7 @@ void SignPipeline::process(const Nv12View &f, std::vector<Detection> &out, Timin
     t.pre_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
     // --- detector
-    const char *din = ort_->det_in.c_str(), *dout = ort_->det_out.c_str();
-    ort_->det->Run(::Ort::RunOptions{nullptr}, &din, &ort_->det_iv, 1, &dout, &ort_->det_ov, 1);
+    det_->run(det_in_.data(), det_out_.data());
     const auto t2 = Clock::now();
     t.det_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
 
@@ -403,7 +386,6 @@ void SignPipeline::process(const Nv12View &f, std::vector<Detection> &out, Timin
     t.post_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
 
     // --- classifier per box
-    const char *cin = ort_->cls_in.c_str(), *cout = ort_->cls_out.c_str();
     const size_t cplane = size_t(cls_s_) * cls_s_;
     for (Detection &d : out) {
         const double bw = d.x1 - d.x0, bh = d.y1 - d.y0, m = cfg_.cls_margin;
@@ -417,7 +399,7 @@ void SignPipeline::process(const Nv12View &f, std::vector<Detection> &out, Timin
         const double sxs = w / rw, sys = h / rh;  // source px per resized px
         nv12_region_to_rgb_planar(f, x0 + l * sxs, y0 + tp * sys, cls_s_ * sxs, cls_s_ * sys, cls_s_, cls_s_,
                                   cls_in_.data(), cls_s_, cplane, 0, 0);
-        ort_->cls->Run(::Ort::RunOptions{nullptr}, &cin, &ort_->cls_iv, 1, &cout, &ort_->cls_ov, 1);
+        cls_->run(cls_in_.data(), cls_out_.data());
         const int k = int(std::max_element(cls_out_.begin(), cls_out_.end()) - cls_out_.begin());
         d.cls_raw = k;
         d.cls_prob = cls_out_[size_t(k)];

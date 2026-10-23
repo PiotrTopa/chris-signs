@@ -7,3 +7,5 @@ models/src/
 .venv-export/
 __pycache__/
 *.pyc
+models/*.param
+models/*.bin

@@ -3,7 +3,8 @@
 // `signs` JSON line per processed frame.
 //
 // Inputs: PPM (P6) / PGM (P5), JPEG (if built with libjpeg), or raw NV12
-// frames (*.nv12 / *.yuv, needs --size WxH). RGB inputs are converted to
+// frames (*.nv12 / *.yuv, needs --size WxH; a file holding several frames
+// back to back is a sequence, --every N takes every Nth). RGB inputs are converted to
 // full-range BT.601 NV12 first (odd sizes cropped by one pixel), so the
 // pipeline sees exactly what it gets from camerad.
 //
@@ -211,8 +212,11 @@ void usage() {
             "usage: signd_replay [options] FILE...\n"
             "  FILE              .ppm/.pgm, .jpg/.jpeg (libjpeg build), or raw NV12 .nv12/.yuv (needs --size)\n"
             "  --size WxH        size of raw NV12 inputs\n"
+            "  --backend ort|ncnn (ort)  --det-backend B  --cls-backend B  --ncnn-fp32  --ncnn-no-flushall\n"
             "  --models-dir DIR  (default /var/lib/roadsense/models)  --det/--cls/--cls-names PATH\n"
             "  --threads N (4)   --cpus LIST (none)   --spin\n"
+            "  --every N         raw NV12 sequences: process every Nth frame (default 1)\n"
+            "  --max-frames N    stop after N processed frames (default: all)\n"
             "  --det-thr X (0.35) --cls-gate X (0.6) --nms-iou X (0.45) --cls-margin X (0)\n"
             "  --max-age N (10)  --min-hits N (3)  --iou-match X (0.1)  --crop-margin X (0.15)\n"
             "  --repeat N        feed every file N times (default 1)\n"
@@ -221,7 +225,8 @@ void usage() {
             "  --no-timing       omit the \"timing\" object\n"
             "  --draw DIR        write DIR/<name>.jpg with the raw detections drawn (--draw-ppm: .ppm)\n"
             "  --crops DIR       save ended-track best crops there (default: not saved)\n"
-            "  --bench N         after the run, time N more detector passes on the last frame (median)\n");
+            "  --bench N         after the run, time N more detector passes on the last frame (median)\n"
+            "stderr at the end: per-frame timing summary (pre/det/cls/total ms: median and p90) over the run\n");
 }
 
 }  // namespace
@@ -230,7 +235,8 @@ int main(int argc, char **argv) {
     PipelineConfig pc;
     TrackerConfig tc;
     std::string cpus = "none", draw_dir, crops_dir;
-    int repeat = 1, bench = 0, raw_w = 0, raw_h = 0;
+    int repeat = 1, bench = 0, raw_w = 0, raw_h = 0, every = 1;
+    uint64_t max_frames = 0;
     bool reset_each = false, raw = false, timing = true, draw_ppm = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; ++i) {
@@ -242,12 +248,15 @@ int main(int argc, char **argv) {
             }
             return argv[++i];
         };
-        if (a == "--models-dir") {
-            const std::string d = val();
-            pc.det_model = d + "/mtsd_signdet_yolov8n_384x640.onnx";
-            pc.cls_model = d + "/mtsd_signcls_yolov8n_64.onnx";
-            pc.cls_names = d + "/mtsd_signcls_classes.txt";
-        } else if (a == "--det") pc.det_model = val();
+        if (a == "--models-dir") pc.models_dir = val();
+        else if (a == "--backend") pc.det_backend = pc.cls_backend = val();
+        else if (a == "--det-backend") pc.det_backend = val();
+        else if (a == "--cls-backend") pc.cls_backend = val();
+        else if (a == "--ncnn-fp32") pc.ncnn_fp16 = false;
+        else if (a == "--ncnn-no-flushall") pc.ncnn_flushall = false;
+        else if (a == "--every") every = std::max(1, atoi(val().c_str()));
+        else if (a == "--max-frames") max_frames = strtoull(val().c_str(), nullptr, 10);
+        else if (a == "--det") pc.det_model = val();
         else if (a == "--cls") pc.cls_model = val();
         else if (a == "--cls-names") pc.cls_names = val();
         else if (a == "--threads") pc.threads = atoi(val().c_str());
@@ -340,38 +349,12 @@ int main(int argc, char **argv) {
         fflush(stdout);
     };
 
-    for (const std::string &path : files) {
-        RgbImage rgb;
-        bool ok = false;
-        if (ends_with(path, ".nv12") || ends_with(path, ".yuv")) {
-            std::vector<uint8_t> b;
-            if (raw_w > 0 && raw_h > 0 && read_all(path, b) && b.size() >= size_t(raw_w) * raw_h * 3 / 2) {
-                frame.width = raw_w;
-                frame.height = raw_h;
-                frame.data.assign(b.begin(), b.begin() + long(size_t(raw_w) * raw_h * 3 / 2));
-                ok = true;
-                if (!draw_dir.empty()) {
-                    nv12_to_rgb(frame.view(), rgb.px);
-                    rgb.w = raw_w;
-                    rgb.h = raw_h;
-                }
-            }
-        } else if (ends_with(path, ".ppm") || ends_with(path, ".pgm") || ends_with(path, ".pnm")) {
-            ok = read_pnm(path, rgb);
-        } else if (ends_with(path, ".jpg") || ends_with(path, ".jpeg")) {
-#ifdef SIGND_HAVE_LIBJPEG
-            ok = read_jpeg(path, rgb);
-#else
-            fprintf(stderr, "signd_replay: built without libjpeg, convert %s to PPM\n", path.c_str());
-#endif
-        }
-        if (!ok) {
-            fprintf(stderr, "signd_replay: cannot read %s\n", path.c_str());
-            continue;
-        }
-        const bool is_nv12 = ends_with(path, ".nv12") || ends_with(path, ".yuv");
-        if (!is_nv12) rgb_to_nv12(rgb.px.data(), rgb.w, rgb.h, frame);
-        fprintf(stderr, "signd_replay: %s %dx%d\n", path.c_str(), frame.width, frame.height);
+    std::vector<double> t_pre, t_det, t_cls, t_tot;
+    uint64_t processed = 0;
+    bool stop = false;
+    fprintf(stderr, "signd_replay: detector on %s (%s), classifier on %s (%s)\n", pipe->det_backend(),
+            pipe->config().det_model.c_str(), pipe->cls_backend(), pipe->config().cls_model.c_str());
+    auto run_frame = [&](const std::string &path, RgbImage &rgb) {
         const Nv12View v = frame.view();
         std::vector<Detection> first_dets;
         for (int r = 0; r < repeat; ++r) {
@@ -383,10 +366,18 @@ int main(int argc, char **argv) {
             const auto tt0 = Clock::now();
             tracker.update(seq, v, dets, reports, ended);
             const double ms = t.total_ms + std::chrono::duration<double, std::milli>(Clock::now() - tt0).count();
+            t_pre.push_back(t.pre_ms);
+            t_det.push_back(t.det_ms);
+            t_cls.push_back(t.cls_ms);
+            t_tot.push_back(t.total_ms);
             FrameMeta m;
             m.seq = seq;
             last = m;
             emit(m, ms, &t, &dets);
+            if (max_frames && ++processed >= max_frames) {
+                stop = true;
+                break;
+            }
         }
         if (reset_each) {
             reports.clear();
@@ -419,12 +410,67 @@ int main(int argc, char **argv) {
             }
             if (!wok) fprintf(stderr, "signd_replay: cannot write %s\n", out.c_str());
         }
+    };
+
+    for (const std::string &path : files) {
+        if (stop) break;
+        RgbImage rgb;
+        if (ends_with(path, ".nv12") || ends_with(path, ".yuv")) {
+            std::vector<uint8_t> b;
+            const size_t fsz = size_t(raw_w) * raw_h * 3 / 2;
+            if (!(raw_w > 0 && raw_h > 0 && read_all(path, b) && b.size() >= fsz)) {
+                fprintf(stderr, "signd_replay: cannot read %s (raw NV12 needs --size WxH)\n", path.c_str());
+                continue;
+            }
+            const size_t nframes = b.size() / fsz;
+            fprintf(stderr, "signd_replay: %s %dx%d, %zu frame(s), every %d\n", path.c_str(), raw_w, raw_h, nframes, every);
+            for (size_t k = 0; k < nframes && !stop; k += size_t(every)) {
+                frame.width = raw_w;
+                frame.height = raw_h;
+                frame.data.assign(b.begin() + long(k * fsz), b.begin() + long((k + 1) * fsz));
+                rgb.px.clear();
+                if (!draw_dir.empty()) {
+                    nv12_to_rgb(frame.view(), rgb.px);
+                    rgb.w = raw_w;
+                    rgb.h = raw_h;
+                }
+                run_frame(nframes > 1 ? path + "." + std::to_string(k) : path, rgb);
+            }
+            continue;
+        }
+        bool ok = false;
+        if (ends_with(path, ".ppm") || ends_with(path, ".pgm") || ends_with(path, ".pnm")) {
+            ok = read_pnm(path, rgb);
+        } else if (ends_with(path, ".jpg") || ends_with(path, ".jpeg")) {
+#ifdef SIGND_HAVE_LIBJPEG
+            ok = read_jpeg(path, rgb);
+#else
+            fprintf(stderr, "signd_replay: built without libjpeg, convert %s to PPM\n", path.c_str());
+#endif
+        }
+        if (!ok) {
+            fprintf(stderr, "signd_replay: cannot read %s\n", path.c_str());
+            continue;
+        }
+        rgb_to_nv12(rgb.px.data(), rgb.w, rgb.h, frame);
+        fprintf(stderr, "signd_replay: %s %dx%d\n", path.c_str(), frame.width, frame.height);
+        run_frame(path, rgb);
     }
     reports.clear();
     ended.clear();
     tracker.flush(ended);
     if (!ended.empty()) emit(last, 0.0, nullptr, nullptr);
 
+    if (!t_tot.empty()) {
+        auto q = [](std::vector<double> v, double f) {
+            std::sort(v.begin(), v.end());
+            return v[std::min(v.size() - 1, size_t(v.size() * f))];
+        };
+        fprintf(stderr,
+                "signd_replay: %zu frames: pre %.1f/%.1f ms, det %.1f/%.1f ms, cls %.1f/%.1f ms, total %.1f/%.1f ms (median/p90)\n",
+                t_tot.size(), q(t_pre, .5), q(t_pre, .9), q(t_det, .5), q(t_det, .9), q(t_cls, .5), q(t_cls, .9), q(t_tot, .5),
+                q(t_tot, .9));
+    }
     if (bench > 0 && frame.width > 0) {
         std::vector<double> tot, det;
         Timing t;

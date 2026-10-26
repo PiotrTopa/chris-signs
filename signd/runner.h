@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -38,6 +39,13 @@ public:
     // in: input_shape floats (NCHW). out: output_size floats, layout of the ONNX output
     // ([5,5040] row-major for the detector, [400] for the classifier). Throws std::runtime_error.
     virtual void run(const float *in, float *out) = 0;
+    // Same as run(), calling before_submit() at the last moment before the GPU work is submitted (ncnn:
+    // after the command buffer and the input upload are recorded; others: before run()). Used by the GPU
+    // schedule so the detector reaches the GPU right when it is handed over.
+    virtual void run_hooked(const float *in, float *out, const std::function<void()> &before_submit) {
+        before_submit();
+        run(in, out);
+    }
 };
 
 // Throws std::runtime_error if the backend is not built in or the model cannot be loaded.

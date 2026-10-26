@@ -24,7 +24,11 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/shm/roadsense-frames
 # uncapped (measured before the clock pins) 9.1 signs/s but road fell to 9.0/s (roadsense docs/lanes/L3-speed.md, 2026-10-26).
 # Needs the ncnn build (scripts/install-phone.sh with
 # NCNN_DIR) and the *-ncnn models; `--backend ort --threads 4` is the CPU fallback.
-ExecStart=/usr/local/bin/signd --det-backend ncnn --cls-backend ort --threads 2 --cpus 4-7 --max-hz 5 --stats 10
+# --gpu-sync turn: the detector asks modeld for the GPU and runs between two model runs instead of
+# stalling one halfway (roadsense docs/ARCHITECTURE.md "GPU schedule", docs/lanes/L4-gpu-sched.md, 2026-10-27:
+# with modeld's turn-taking road 13.0 -> 14.05 runs/s and road latency p90 168 -> 126 ms at 5.0 signs/s; signs
+# latency +15 ms: 118 -> 134 ms median). Without modeld it does not wait.
+ExecStart=/usr/local/bin/signd --det-backend ncnn --cls-backend ort --threads 2 --cpus 4-7 --max-hz 5 --gpu-sync turn --stats 10
 Restart=always
 RestartSec=2
 Nice=-5

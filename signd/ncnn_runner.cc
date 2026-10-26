@@ -16,6 +16,7 @@
 #include <stdexcept>
 
 #include <gpu.h>
+#include <command.h>
 #include <net.h>
 
 #include "runner.h"
@@ -96,11 +97,13 @@ public:
 
     const char *name() const override { return "ncnn"; }
 
-    void run(const float *in, float *out) override {
+    void run(const float *in, float *out) override { run_hooked(in, out, nullptr); }
+
+    void run_hooked(const float *in, float *out, const std::function<void()> &before_submit) override {
         const size_t plane = size_t(w_) * h_;
         for (int c = 0; c < c_; ++c)  // channel stride may be padded: copy per channel
             std::memcpy(in_.channel(c), in + c * plane, plane * sizeof(float));
-        if (extract() != out_n_) throw std::runtime_error("ncnn: output size changed");
+        if (extract(before_submit) != out_n_) throw std::runtime_error("ncnn: output size changed");
         size_t off = 0;
         for (const ncnn::Mat &m : outv_) {
             // Mats are unpacked fp32 with w contiguous per row; rows may be padded only across
@@ -116,17 +119,52 @@ public:
     }
 
 private:
-    size_t extract() {
-        ncnn::Extractor ex = net_.create_extractor();
-        if (ex.input("in0", in_) != 0) throw std::runtime_error("ncnn: bad input in0");
+    // All outputs are recorded into one command buffer and downloaded with one submit (ncnn's own
+    // Extractor::extract(Mat) submits once per output, i.e. two GPU submits per detector run with a CPU
+    // round trip between them; one submit lets a GPU schedule hand the GPU over cleanly, roadsense
+    // docs/lanes/L4-gpu-sched.md). Same layers, same download path as ncnn's extract: identical outputs.
+    size_t extract(const std::function<void()> &before_submit = nullptr) {
+        const ncnn::VulkanDevice *vkdev = net_.vulkan_device();
+        ncnn::VkAllocator *blob_alloc = vkdev->acquire_blob_allocator();
+        ncnn::VkAllocator *staging_alloc = vkdev->acquire_staging_allocator();
+        struct Release {
+            const ncnn::VulkanDevice *d;
+            ncnn::VkAllocator *b, *s;
+            ~Release() { d->reclaim_blob_allocator(b), d->reclaim_staging_allocator(s); }
+        } release{vkdev, blob_alloc, staging_alloc};
+        ncnn::Option opt = net_.opt;
+        opt.blob_vkallocator = blob_alloc;
+        opt.workspace_vkallocator = blob_alloc;
+        opt.staging_vkallocator = staging_alloc;
         size_t n = 0;
-        for (size_t i = 0; i < outs_.size(); ++i) {
-            const int r = ex.extract(outs_[i].c_str(), outv_[i]);
-            if (r != 0 || outv_[i].empty() || outv_[i].elemsize != 4)
-                throw std::runtime_error("ncnn: extract " + outs_[i] + " failed (" + std::to_string(r) + ")");
-            if (outv_[i].dims == 3 && outv_[i].c > 1 && outv_[i].cstep != size_t(outv_[i].w) * outv_[i].h)
-                throw std::runtime_error("ncnn: padded 3-D output not supported");
-            n += outv_[i].total();
+        {
+            ncnn::Extractor ex = net_.create_extractor();
+            ex.set_blob_vkallocator(blob_alloc);
+            ex.set_workspace_vkallocator(blob_alloc);
+            ex.set_staging_vkallocator(staging_alloc);
+            if (ex.input("in0", in_) != 0) throw std::runtime_error("ncnn: bad input in0");
+            ncnn::VkCompute cmd(vkdev);
+            std::vector<ncnn::VkMat> gpu(outs_.size());
+            std::vector<ncnn::Mat> raw(outs_.size());
+            for (size_t i = 0; i < outs_.size(); ++i) {
+                const int r = ex.extract(outs_[i].c_str(), gpu[i], cmd);
+                if (r != 0 || gpu[i].dims == 0) throw std::runtime_error("ncnn: extract " + outs_[i] + " failed (" + std::to_string(r) + ")");
+            }
+            for (size_t i = 0; i < outs_.size(); ++i) cmd.record_download(gpu[i], raw[i], opt);
+            if (before_submit) before_submit();
+            if (cmd.submit_and_wait() != 0) throw std::runtime_error("ncnn: submit failed");
+            for (size_t i = 0; i < outs_.size(); ++i) {
+                if (raw[i].elempack != 1) {
+                    ncnn::convert_packing(raw[i], outv_[i], 1, opt);
+                } else {
+                    outv_[i] = raw[i];
+                }
+                if (outv_[i].empty() || outv_[i].elemsize != 4)
+                    throw std::runtime_error("ncnn: output " + outs_[i] + " is not fp32 after download");
+                if (outv_[i].dims == 3 && outv_[i].c > 1 && outv_[i].cstep != size_t(outv_[i].w) * outv_[i].h)
+                    throw std::runtime_error("ncnn: padded 3-D output not supported");
+                n += outv_[i].total();
+            }
         }
         return n;
     }

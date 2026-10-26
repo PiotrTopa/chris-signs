@@ -22,6 +22,7 @@
 #include <string>
 #include <thread>
 
+#include "gpusched.h"
 #include "jsonsock.h"
 #include "output.h"
 #include "ring.h"
@@ -48,6 +49,9 @@ struct Options {
     double max_hz = 0;  // 0 = as fast as the pipeline goes
     bool timing = false;
     bool verbose = false;
+    std::string gpu_sync = "none";  // none | after | turn (roadsense docs/ARCHITECTURE.md, GPU schedule)
+    std::string gpu_sched;          // default <rundir>/gpu.sched
+    int gpu_sync_timeout_ms = 150;
 };
 
 std::string config_dir() {
@@ -140,6 +144,10 @@ void usage() {
             "  --crop-margin X   relative margin of the saved best crop (default 0.15)\n"
             "  --max-crops N     keep at most N crop files written by this process (default 500, 0 = unlimited)\n"
             "  --max-hz X        process at most X frames/s (duty cycle; default 0 = as fast as possible)\n"
+            "  --gpu-sync M      none (default): ignore modeld; after: start each detector run right after a modeld\n"
+            "                    run ends (modeld's GPU tick); turn: also ask modeld to wait until the detector is done\n"
+            "  --gpu-sched PATH  GPU schedule file (default <rundir>/gpu.sched, created by modeld)\n"
+            "  --gpu-sync-timeout MS  longest wait for modeld's tick (default 150); no wait if modeld is absent\n"
             "  --timing          add a non-contract \"timing\" object to every message\n"
             "  --frames N        exit after N processed frames (testing)\n"
             "  --stats S         stderr stats interval in s (default 10, 0 = off)\n"
@@ -178,6 +186,9 @@ void load_config(Options &o) {
     if (json_number(s, "crop_margin", &v)) o.tc.crop_margin = float(v);
     if (json_number(s, "max_crops", &v)) o.max_crops = size_t(v);
     if (json_number(s, "max_hz", &v)) o.max_hz = v;
+    if (json_string(s, "gpu_sync", &str)) o.gpu_sync = str;
+    if (json_string(s, "gpu_sched", &str)) o.gpu_sched = str;
+    if (json_number(s, "gpu_sync_timeout_ms", &v)) o.gpu_sync_timeout_ms = int(v);
 }
 
 }  // namespace
@@ -218,6 +229,9 @@ int main(int argc, char **argv) {
         else if (a == "--crop-margin") opt.tc.crop_margin = float(atof(val().c_str()));
         else if (a == "--max-crops") opt.max_crops = size_t(atol(val().c_str()));
         else if (a == "--max-hz") opt.max_hz = atof(val().c_str());
+        else if (a == "--gpu-sync") opt.gpu_sync = val();
+        else if (a == "--gpu-sched") opt.gpu_sched = val();
+        else if (a == "--gpu-sync-timeout") opt.gpu_sync_timeout_ms = atoi(val().c_str());
         else if (a == "--timing") opt.timing = true;
         else if (a == "--frames") opt.max_frames = strtoull(val().c_str(), nullptr, 10);
         else if (a == "--stats") opt.stats_s = atof(val().c_str());
@@ -229,6 +243,10 @@ int main(int argc, char **argv) {
     }
     const char *rd = getenv("ROADSENSE_RUNDIR");
     const std::string rundir = (rd && *rd) ? rd : "/run/roadsense";
+    if (opt.gpu_sync != "none" && opt.gpu_sync != "after" && opt.gpu_sync != "turn") {
+        fprintf(stderr, "signd: bad --gpu-sync '%s' (none, after, turn)\n", opt.gpu_sync.c_str());
+        return 2;
+    }
 
     if (opt.cpus != "none" && !opt.cpus.empty()) {
         cpu_set_t set;
@@ -272,6 +290,32 @@ int main(int argc, char **argv) {
     }
     CropStore crops(rundir + "/crops", opt.max_crops);
     if (!crops.init(&err)) fprintf(stderr, "signd: %s (crops disabled)\n", err.c_str());
+
+    // GPU schedule (optional): align the detector with the end of a modeld run so it fills modeld's
+    // CPU gap instead of stalling a modeld run halfway. Never blocks if modeld is not there.
+    GpuSched gs;
+    bool turn_held = false;
+    Clock::time_point turn_t0;
+    uint64_t stats_ticks = 0, stats_turns = 0;
+    double stats_wait = 0;
+    if (opt.gpu_sync != "none") {
+        const std::string gp = opt.gpu_sched.empty() ? rundir + "/gpu.sched" : opt.gpu_sched;
+        gs.open(gp, false);  // may not exist yet: peer_alive() retries once per second
+        const bool want_turn = opt.gpu_sync == "turn";
+        pipe->before_det = [&gs, &turn_held, &turn_t0, &stats_ticks, &stats_turns, &opt, want_turn] {
+            bool tick = false;
+            turn_held = gs.wait_run_end(opt.gpu_sync_timeout_ms, want_turn, &tick);
+            turn_t0 = Clock::now();
+            stats_ticks += tick;
+            stats_turns += turn_held;
+        };
+        pipe->after_det = [&gs, &turn_held, &turn_t0] {
+            if (turn_held) gs.end_turn(std::chrono::duration<double, std::milli>(Clock::now() - turn_t0).count());
+            turn_held = false;
+        };
+        fprintf(stderr, "signd: GPU sync %s via %s (timeout %d ms)\n", opt.gpu_sync.c_str(), gp.c_str(),
+                opt.gpu_sync_timeout_ms);
+    }
 
     Tracker tracker(opt.tc, pipe->names());
     RingReader rr(ring_path());
@@ -342,6 +386,7 @@ int main(int argc, char **argv) {
         try {
             pipe->process(v, dets, &t);
         } catch (const std::exception &e) {
+            if (turn_held) gs.end_turn(), turn_held = false;
             fprintf(stderr, "signd: inference failed: %s\n", e.what());
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             continue;
@@ -360,6 +405,7 @@ int main(int argc, char **argv) {
         ++stats_n;
         stats_ms += detect_ms;
         stats_det += t.det_ms;
+        stats_wait += t.wait_ms;
         if (opt.verbose)
             fprintf(stderr, "signd: seq %llu: %zu raw, %zu reported, %zu ended, %.1f ms (pre %.1f det %.1f cls %.1f)\n",
                     (unsigned long long)fv.seq, dets.size(), reports.size(), ended.size(), detect_ms, t.pre_ms,
@@ -367,12 +413,15 @@ int main(int argc, char **argv) {
         const double el = std::chrono::duration<double>(Clock::now() - stats_t0).count();
         if (opt.stats_s > 0 && el >= opt.stats_s) {
             fprintf(stderr,
-                    "signd: %.2f fps, detect_ms %.1f (det %.1f), live tracks %zu, frames skipped %llu, clients %zu\n",
+                    "signd: %.2f fps, detect_ms %.1f (det %.1f), live tracks %zu, frames skipped %llu, clients %zu, "
+                    "gpu wait %.1f ms, ticks %llu, turns %llu\n",
                     stats_n / el, stats_ms / stats_n, stats_det / stats_n, tracker.live(),
-                    (unsigned long long)skipped, srv.client_count());
+                    (unsigned long long)skipped, srv.client_count(), stats_wait / stats_n,
+                    (unsigned long long)stats_ticks, (unsigned long long)stats_turns);
             stats_t0 = Clock::now();
             stats_n = 0;
-            stats_ms = stats_det = 0;
+            stats_ms = stats_det = stats_wait = 0;
+            stats_ticks = stats_turns = 0;
         }
         if (opt.max_frames && processed >= opt.max_frames) break;
     }

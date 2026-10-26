@@ -340,10 +340,19 @@ void SignPipeline::process(const Nv12View &f, std::vector<Detection> &out, Timin
     const auto t1 = Clock::now();
     t.pre_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-    // --- detector
-    det_->run(det_in_.data(), det_out_.data());
+    // --- detector (the GPU-schedule hook runs between recording and submitting, see runner.h)
+    if (before_det) {
+        det_->run_hooked(det_in_.data(), det_out_.data(), [&] {
+            const auto tw0 = Clock::now();
+            before_det();
+            t.wait_ms = std::chrono::duration<double, std::milli>(Clock::now() - tw0).count();
+        });
+    } else {
+        det_->run(det_in_.data(), det_out_.data());
+    }
+    if (after_det) after_det();
     const auto t2 = Clock::now();
-    t.det_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    t.det_ms = std::chrono::duration<double, std::milli>(t2 - t1).count() - t.wait_ms;
 
     // --- decode + NMS
     std::vector<Detection> cand;

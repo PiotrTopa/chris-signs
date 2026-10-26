@@ -7,6 +7,7 @@
 #
 # Builds against the IPC headers of a roadsense checkout (MIT, header-only, no linking):
 #   camerad/ring.h       frame-ring reader
+#   camerad/gpusched.h   optional GPU turn-taking with modeld (--gpu-sync)
 #   camerad/jsonsock.h   JSON-lines Unix socket server
 #   camerad/jpeg_nv12.h  NV12 -> JPEG encoder (sign crops)
 #   cmake -S . -B build -DROADSENSE_DIR=/path/to/roadsense
@@ -35,7 +36,7 @@ find_package(Threads REQUIRED)
 
 set(ROADSENSE_DIR "${CMAKE_SOURCE_DIR}/../roadsense" CACHE PATH "roadsense checkout (for camerad/ring.h, jsonsock.h, jpeg_nv12.h)")
 get_filename_component(ROADSENSE_DIR "${ROADSENSE_DIR}" ABSOLUTE)
-foreach(h ring.h jsonsock.h jpeg_nv12.h)
+foreach(h ring.h jsonsock.h jpeg_nv12.h gpusched.h)
   if(NOT EXISTS "${ROADSENSE_DIR}/camerad/${h}")
     message(FATAL_ERROR "${ROADSENSE_DIR}/camerad/${h} not found (set -DROADSENSE_DIR=/path/to/roadsense)")
   endif()

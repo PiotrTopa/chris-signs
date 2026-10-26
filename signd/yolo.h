@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -85,6 +86,7 @@ struct Detection {
 
 struct Timing {
     double pre_ms = 0, det_ms = 0, post_ms = 0, cls_ms = 0, total_ms = 0;
+    double wait_ms = 0;  // time spent in the before-detector hook (GPU schedule), included in total_ms
 };
 
 // Class names: raw MTSD names (with --gN variant suffix) and the merged label
@@ -113,6 +115,11 @@ public:
     int input_h() const { return in_h_; }
     const char *det_backend() const { return det_->name(); }
     const char *cls_backend() const { return cls_->name(); }
+    // Optional hooks around the detector run (signd: GPU turn-taking with modeld, roadsense
+    // docs/ARCHITECTURE.md "GPU schedule"). before_det runs after the letterbox, at the last moment before
+    // the detector's GPU work is submitted (ncnn: once its command buffer is recorded, ModelRunner::run_hooked);
+    // after_det right after the detector returns. Timing::wait_ms is the time spent in before_det.
+    std::function<void()> before_det, after_det;
 
 private:
     std::unique_ptr<ModelRunner> det_, cls_;

@@ -219,6 +219,7 @@ void usage() {
             "  --max-frames N    stop after N processed frames (default: all)\n"
             "  --det-thr X (0.35) --cls-gate X (0.6) --nms-iou X (0.45) --cls-margin X (0)\n"
             "  --max-age N (10)  --min-hits N (3)  --iou-match X (0.1)  --crop-margin X (0.15)\n"
+            "  --dist-match X (1.0)  --dist-match-new X (1.0, tracks with one hit)\n"
             "  --no-appearance   skip the glow check on round red detections (default on)\n"
             "  --verifier PATH   sign/lamp verifier .onnx (32x32 RGB -> logit) for round red detections (default none)\n"
             "  --glow-px X (0.10) --glow-share X (0.5) --verify-thr X (0.3) --verify-vouch X (0.9)   round red track\n"
@@ -276,6 +277,8 @@ int main(int argc, char **argv) {
         else if (a == "--max-age") tc.max_age = atoi(val().c_str());
         else if (a == "--min-hits") tc.min_hits = atoi(val().c_str());
         else if (a == "--iou-match") tc.iou_match = float(atof(val().c_str()));
+        else if (a == "--dist-match") tc.dist_match = float(atof(val().c_str()));
+        else if (a == "--dist-match-new") tc.dist_match_new = float(atof(val().c_str()));
         else if (a == "--crop-margin") tc.crop_margin = float(atof(val().c_str()));
         else if (a == "--no-appearance") pc.appearance = false;
         else if (a == "--verifier") pc.verifier_model = val();

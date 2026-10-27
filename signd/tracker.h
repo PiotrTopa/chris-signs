@@ -34,6 +34,8 @@ struct TrackerConfig {
     int min_hits = 3;          // matched detections before a track is confirmed (reported)
     float iou_match = 0.1f;    // min IoU for the first association pass
     float dist_match = 1.0f;   // max centre distance / max(w,h) for the fallback pass
+    float dist_match_new = 1.0f;  // the same for a track with one hit (no velocity yet): at 5 Hz a small sign at
+                                  // the frame edge moves more than its own width between processed frames (L12)
     float cls_gate = 0.6f;     // classifier probability needed for a vote
     float crop_margin = 0.15f; // relative margin around the box for the saved crop
     // Acceptance (roadsense lane L8). A confirmed track is still reported, but flagged `suppressed` with a

@@ -261,7 +261,7 @@ void Tracker::update(uint64_t seq, const Nv12View &frame, const std::vector<Dete
             if (ratio < 0.5f || ratio > 2.0f) continue;
             const float dx = (d.x0 + d.x1 - p[0] - p[2]) / 2, dy = (d.y0 + d.y1 - p[1] - p[3]) / 2;
             const float dist = std::sqrt(dx * dx + dy * dy) / std::max({pw, ph, dw, dh, 1.f});
-            if (dist <= cfg_.dist_match) pairs.push_back({dist, int(i), int(j)});
+            if (dist <= (tracks_[i].hits <= 1 ? cfg_.dist_match_new : cfg_.dist_match)) pairs.push_back({dist, int(i), int(j)});
         }
     }
     assign();

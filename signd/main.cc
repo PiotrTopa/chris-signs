@@ -154,6 +154,8 @@ void usage() {
             "  --max-age N       tracker: processed frames without match before a track ends (default 10)\n"
             "  --min-hits N      tracker: hits before a track is reported (default 3)\n"
             "  --iou-match X     tracker: min IoU to associate (default 0.1)\n"
+            "  --dist-match X    tracker: max centre distance / box size, fallback pass (default 1.0)\n"
+            "  --dist-match-new X  the same for tracks with one hit (default 1.0)\n"
             "  --crop-margin X   relative margin of the saved best crop (default 0.15)\n"
             "  --no-appearance   skip the glow check on round red detections (default on)\n"
             "  --verifier PATH   sign/lamp verifier .onnx (32x32 RGB -> logit) for round red detections (default none)\n"
@@ -178,7 +180,7 @@ void usage() {
             "  --verbose\n"
             "config: $ROADSENSE_CONFIG_DIR (default /etc/roadsense)/signd.json, keys backend, det_backend, cls_backend,\n"
             "        models_dir, det_model, cls_model, cls_names, threads, cpus, nice, spin, ncnn_fp16, ncnn_flushall,\n"
-            "        det_thr, cls_gate, nms_iou, cls_margin, max_age, min_hits, iou_match, crop_margin, max_crops, max_hz,\n"
+            "        det_thr, cls_gate, nms_iou, cls_margin, max_age, min_hits, iou_match, dist_match, dist_match_new, crop_margin, max_crops, max_hz,\n"
             "        appearance, verifier, glow_px, glow_share, glow_alone, verify_thr, verify_vouch, class_min_score (CLI wins)\n"
             "env: ROADSENSE_RUNDIR (default /run/roadsense), ROADSENSE_RING (default /dev/shm/roadsense-frames)\n");
 }
@@ -208,6 +210,8 @@ void load_config(Options &o) {
     if (json_number(s, "max_age", &v)) o.tc.max_age = int(v);
     if (json_number(s, "min_hits", &v)) o.tc.min_hits = int(v);
     if (json_number(s, "iou_match", &v)) o.tc.iou_match = float(v);
+    if (json_number(s, "dist_match", &v)) o.tc.dist_match = float(v);
+    if (json_number(s, "dist_match_new", &v)) o.tc.dist_match_new = float(v);
     if (json_number(s, "crop_margin", &v)) o.tc.crop_margin = float(v);
     if (json_number(s, "max_crops", &v)) o.max_crops = size_t(v);
     if (json_number(s, "max_hz", &v)) o.max_hz = v;
@@ -279,6 +283,8 @@ int main(int argc, char **argv) {
         else if (a == "--max-age") opt.tc.max_age = atoi(val().c_str());
         else if (a == "--min-hits") opt.tc.min_hits = atoi(val().c_str());
         else if (a == "--iou-match") opt.tc.iou_match = float(atof(val().c_str()));
+        else if (a == "--dist-match") opt.tc.dist_match = float(atof(val().c_str()));
+        else if (a == "--dist-match-new") opt.tc.dist_match_new = float(atof(val().c_str()));
         else if (a == "--crop-margin") opt.tc.crop_margin = float(atof(val().c_str()));
         else if (a == "--no-appearance") opt.pc.appearance = false;
         else if (a == "--verifier") opt.pc.verifier_model = val();

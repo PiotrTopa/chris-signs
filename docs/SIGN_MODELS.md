@@ -213,3 +213,25 @@ still 0 %, ride real signs 94.5 %.
 Data licences: BDD100K (non-commercial research licence), GTSRB (free to use with citation of Stallkamp
 et al., IJCNN 2011; Zenodo copy record 13741936 lists CC BY 4.0), Krakow ride (CC BY 3.0, Relaxing Roads
 4K via Wikimedia Commons). **The verifier weights are never committed**; the scripts are.
+
+## 7. Classifier retrained on MTSD with "not a sign" (roadsense lane L12, 2026-10-27)
+
+`mtsd_signcls_l12_64.onnx` + `mtsd_signcls_l12_classes.txt`: same architecture as the original (YOLOv8n-cls,
+1.95 M parameters, input `images` [1,3,64,64] RGB /255, output `output0` [1,402] softmax, opset 17) and the same
+preprocessing; 402 classes = the original 400 in the same order (ids unchanged) + `other-sign` (a real sign outside
+the 400, MTSD's own label) + `background` (not a sign). signd flags a track whose vote is `background` as
+`suppressed`, reason `not_a_sign`; `other-sign` tracks are reported as such and match no rule.
+
+Training (dev box, `tools/mtsd/`, never on the phone): `fetch.sh` (resumable download from the signed MTSD links;
+fully annotated train/val + annotations), `extract_crops.py` (96x96 crops streamed from the zips; the installed
+detector's matched boxes as extra positives and its false positives as `background`), `extract_bdd.py` (BDD100K
+train split: stop/tail lamps, red lights, traffic lights, detector false positives as `background`),
+`train_cls.py` (from scratch, no downloaded checkpoint; 30 epochs x 200 k phone-like renderings from `cls_aug.py`:
+box jitter, downscale to the box's size on a 1280-px frame, JPEG, NV12 chroma, photometric; ~30 min on a Quadro
+P3200), `eval_cls.py` (held-out scoring). Held-out MTSD val top-1 at phone size 0.859 -> 0.939 (<= 16 px 0.783 ->
+0.919); BDD test lamps/red lights given a sign class 66-85 % -> 0-1 %; warning triangles read as priority-road
+19/1722 -> 0. On six Polish rides (roadsense L12): false rules 51 -> 47 together with `--dist-match-new 2.0`.
+
+Licence: MTSD is CC BY-NC-SA 4.0, BDD100K non-commercial research: the weights are research-licensed, installed by
+hand, **never committed**; the scripts are AGPL like the rest of this repository. Phone cost: the same as the
+original classifier (25 ms per frame for 75 crops on the little cores either way).

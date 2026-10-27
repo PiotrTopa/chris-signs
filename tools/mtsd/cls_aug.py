@@ -28,21 +28,22 @@ def _nv12(img):
 
 def render(x, sw, sh, s, rng=None, jitter=0.0, jpeg=None, photo=False, rot=0.0):
     """x: uint8 [96,96,3]; (sw, sh): box size in stored px; s: target box long side in frame px (None/>=64: none)."""
-    cx = cy = S / 2.0
+    R = x.shape[0]                    # stored region size (96, or smaller when train_cls.py shrinks it)
+    cx = cy = R / 2.0
     bw, bh = float(sw), float(sh)
     if rng is not None and jitter > 0:
         cx += rng.normal(0, jitter) * bw; cy += rng.normal(0, jitter) * bh
         bw *= np.exp(rng.normal(0, jitter * 1.5)); bh *= np.exp(rng.normal(0, jitter * 1.5))
     img = x
     if rot:
-        M = cv2.getRotationMatrix2D((S / 2, S / 2), rot, 1.0)
-        img = cv2.warpAffine(img, M, (S, S), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        M = cv2.getRotationMatrix2D((R / 2, R / 2), rot, 1.0)
+        img = cv2.warpAffine(img, M, (R, R), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
     f = 1.0
     if s is not None and s < max(bw, bh):
         f = s / max(bw, bh)
-        n = max(2, int(round(S * f)))
+        n = max(2, int(round(R * f)))
         img = cv2.resize(img, (n, n), interpolation=cv2.INTER_AREA)
-        f = n / S
+        f = n / R
     if jpeg:
         ok, enc = cv2.imencode('.jpg', img[..., ::-1], [cv2.IMWRITE_JPEG_QUALITY, int(jpeg)])
         img = cv2.imdecode(enc, cv2.IMREAD_COLOR)[..., ::-1]

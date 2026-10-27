@@ -38,7 +38,12 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/shm/roadsense-frames
 # are flagged `suppressed` by the verifier CNN (docs/SIGN_MODELS.md section 6; research-licensed, installed by hand;
 # a missing file just disables it), glow (only while the verifier is unsure) and no-entry's minimum best score 0.71.
 # Krakow replay (2 loops): false no-entry tracks 9.5 -> 0 per loop, real round red tracks kept 65/65, no road/signs cost.
-ExecStart=/usr/local/bin/signd --det-backend ncnn --cls-backend ort --threads 2 --cpus 4-7 --max-hz 5 --gpu-sync turn --stats 10 --lights --lights-backend ncnn-cpu --lights-threads 2 --lights-cpus 4-7 --lights-hz 3 --lights-state /var/lib/roadsense/models/lights_state_bdd_48x24.onnx --verifier /var/lib/roadsense/models/sign_verifier_32.onnx --class-min-score regulatory--no-entry=0.71
+# L12 (roadsense docs/lanes/L12-mtsd-retrain.md, 2026-10-27): classifier retrained on MTSD with `other-sign` and
+# `background` classes (docs/SIGN_MODELS.md section 7; CC BY-NC-SA data, installed by hand, never committed: without
+# the file signd does not start; drop --cls/--cls-names to fall back to the original classifier); tracks voted
+# `background` are flagged `not_a_sign`; --dist-match-new 2.0 lets a one-hit track follow a small sign that moves more
+# than its width between 5 Hz frames (the krakow B-33 70 and the s1 D-7 were detected but never tracked).
+ExecStart=/usr/local/bin/signd --det-backend ncnn --cls-backend ort --threads 2 --cpus 4-7 --max-hz 5 --gpu-sync turn --stats 10 --lights --lights-backend ncnn-cpu --lights-threads 2 --lights-cpus 4-7 --lights-hz 3 --lights-state /var/lib/roadsense/models/lights_state_bdd_48x24.onnx --verifier /var/lib/roadsense/models/sign_verifier_32.onnx --class-min-score regulatory--no-entry=0.71 --cls /var/lib/roadsense/models/mtsd_signcls_l12_64.onnx --cls-names /var/lib/roadsense/models/mtsd_signcls_l12_classes.txt --dist-match-new 2.0
 Restart=always
 RestartSec=2
 Nice=-5

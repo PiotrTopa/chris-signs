@@ -7,7 +7,7 @@ usage: train_cls.py --classes BASE_CLASSES.txt --train DIR [DIR ...] --out OUT_D
 
 Class list: the 400 names of BASE_CLASSES.txt in the same order (ids unchanged), then `other-sign`, `background`.
 Sample selection (from extract_crops.py / extract_bdd.py shards): gt + detpos of every class except `ambiguous`
-objects; `other-sign` gt kept at 50 %; detneg all; rand 50 %; BDD background crops of the train split only.
+objects; `other-sign` gt kept at 50 %; detneg all; rand 30 %; BDD background crops of the train split only.
 Rendering: cls_aug.train_sample (box jitter, phone-size downscale, JPEG, NV12 chroma, photometric). No flips.
 Sampling: per class weight 1 / sqrt(count) (long tail), CE with label smoothing 0.1, AdamW, cosine schedule.
 MTSD (CC BY-NC-SA 4.0) and BDD100K (non-commercial research) derived weights are never committed.
@@ -18,16 +18,20 @@ import torch, torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cls_aug  # noqa: E402
+import cv2  # noqa: E402
+
+RS = 72   # stored regions are shrunk 96 -> 72 px at load (box 48 px) to fit the 12 GB memory cap
 
 
 def load(dirs, names, bdd=None, seed=0, split=None):
+    """two passes (metadata, then pixels into one preallocated array) to keep the peak memory at one copy"""
     idx = {n: i for i, n in enumerate(names)}
     rng = np.random.default_rng(seed)
-    Xs, Y, MM = [], [], []
     files = sorted(f for d in dirs for f in glob.glob(f'{d}/*.npz'))
     if bdd: files.append(bdd)
+    sel = []
     for f in files:
-        d = np.load(f); M = json.loads(str(d['meta']))
+        M = json.loads(str(np.load(f)['meta']))
         keep = []
         for i, m in enumerate(M):
             if split and m.get('split', split) != split: continue
@@ -35,14 +39,20 @@ def load(dirs, names, bdd=None, seed=0, split=None):
             if lab not in idx: continue
             if 'ambiguous' in m.get('flags', []) or 'dummy' in m.get('flags', []): continue
             if k == 'gt' and lab == 'other-sign' and rng.random() > 0.5: continue
-            if k == 'rand' and rng.random() > 0.5: continue
+            if k == 'rand' and rng.random() > 0.3: continue
             keep.append(i)
-        if not keep: continue
-        X = d['X']
-        Xs.append(X[keep]); Y += [idx[M[i]['label']] for i in keep]
-        MM += [{'sw': M[i]['sw'], 'sh': M[i]['sh'], 'w': M[i]['w'], 'h': M[i]['h'], 'W': M[i]['W'], 'kind': M[i]['kind']} for i in keep]
+        sel.append((f, keep, [M[i] for i in keep]))
         print(f'{os.path.basename(f)}: {len(keep)} of {len(M)}', flush=True)
-    return np.concatenate(Xs), np.array(Y, np.int64), MM
+    n = sum(len(k) for _, k, _ in sel)
+    X = np.empty((n, RS, RS, 3), np.uint8); Y, MM = [], []
+    o = 0
+    for f, keep, ms in sel:
+        if keep:
+            for x in np.load(f)['X'][keep]:
+                X[o] = x if RS == 96 else cv2.resize(x, (RS, RS), interpolation=cv2.INTER_AREA); o += 1
+        Y += [idx[m['label']] for m in ms]
+        MM += [(m['sw'] * RS / 96, m['sh'] * RS / 96, m['w'], m['h'], m['W']) for m in ms]
+    return X, np.array(Y, np.int64), np.array(MM, np.float32)   # metadata as one array: no per-worker copies
 
 
 class DS(torch.utils.data.Dataset):
@@ -50,7 +60,8 @@ class DS(torch.utils.data.Dataset):
     def __len__(self): return len(self.Y)
     def __getitem__(self, i):
         rng = np.random.default_rng((i * 7919 + int(time.time_ns() % 1000003)) & 0xffffffff)
-        im = cls_aug.train_sample(self.X[i], self.M[i], rng)
+        sw, sh, w, h, W = (float(v) for v in self.M[i])
+        im = cls_aug.train_sample(self.X[i], {'sw': sw, 'sh': sh, 'w': w, 'h': h, 'W': W}, rng)
         return torch.from_numpy(np.ascontiguousarray(im.transpose(2, 0, 1))), int(self.Y[i])
 
 
@@ -72,7 +83,8 @@ def main():
     w = np.where(cnt > 0, 1.0 / np.sqrt(np.maximum(cnt, 1)), 0)[Y]
     sampler = torch.utils.data.WeightedRandomSampler(torch.tensor(w, dtype=torch.double), a.epoch_size, replacement=True)
     dl = torch.utils.data.DataLoader(DS(X, Y, M), batch_size=a.batch, sampler=sampler, num_workers=a.workers,
-                                     persistent_workers=True, drop_last=True, prefetch_factor=4)
+                                     persistent_workers=True, drop_last=True, prefetch_factor=4,
+                                     multiprocessing_context='fork')   # Python 3.14 defaults to forkserver: would pickle X per worker
     from ultralytics.nn.tasks import ClassificationModel
     torch.manual_seed(0)
     model = ClassificationModel('yolov8n-cls.yaml', nc=len(names), verbose=False).cuda()

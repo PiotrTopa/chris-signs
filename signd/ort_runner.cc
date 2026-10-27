@@ -68,7 +68,7 @@ std::unique_ptr<ModelRunner> make_ort_runner(const RunnerOptions &opt) { return 
 bool runner_available(const std::string &backend) {
     if (backend == "ort") return true;
 #ifdef ROADSENSE_HAVE_NCNN
-    if (backend == "ncnn") return true;
+    if (backend == "ncnn" || backend == "ncnn-cpu") return true;
 #endif
     return false;
 }
@@ -76,10 +76,10 @@ bool runner_available(const std::string &backend) {
 std::unique_ptr<ModelRunner> make_runner(const RunnerOptions &opt) {
     if (opt.backend == "ort") return make_ort_runner(opt);
 #ifdef ROADSENSE_HAVE_NCNN
-    if (opt.backend == "ncnn") return make_ncnn_runner(opt);
+    if (opt.backend == "ncnn" || opt.backend == "ncnn-cpu") return make_ncnn_runner(opt);
 #endif
     throw std::runtime_error("backend '" + opt.backend + "' not available in this build (ort" +
-                             (runner_available("ncnn") ? ", ncnn)" : ")"));
+                             (runner_available("ncnn") ? ", ncnn, ncnn-cpu)" : ")"));
 }
 
 }  // namespace signs

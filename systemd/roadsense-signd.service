@@ -28,7 +28,13 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/shm/roadsense-frames
 # stalling one halfway (roadsense docs/ARCHITECTURE.md "GPU schedule", docs/lanes/L4-gpu-sched.md, 2026-10-27:
 # with modeld's turn-taking road 13.0 -> 14.05 runs/s and road latency p90 168 -> 126 ms at 5.0 signs/s; signs
 # latency +15 ms: 118 -> 134 ms median). Without modeld it does not wait.
-ExecStart=/usr/local/bin/signd --det-backend ncnn --cls-backend ort --threads 2 --cpus 4-7 --max-hz 5 --gpu-sync turn --stats 10
+# --lights: traffic lights in a second thread (<rundir>/lightd.sock, roadsense docs/lanes/L7-traffic-lights.md, 2026-10-27):
+# BDD100K YOLO11n 960x320 on the upper 62 % of the frame with ncnn's CPU kernels on the big cores (2 threads), 3 Hz,
+# state CNN per light. Cost on the replay: road 14.04 -> 13.72 runs/s, signs unchanged (4.99/s), lights 3.0/s at
+# ~140 ms frame->ws. On the GPU (turns with modeld) the same detector cost 4 road runs/s; on the little cores
+# (--lights-cpus 0-3 --lights-threads 4) road 13.78/s but lights latency 213 ms. Without the state CNN file
+# (research-licensed, installed by hand) the colour rule decides.
+ExecStart=/usr/local/bin/signd --det-backend ncnn --cls-backend ort --threads 2 --cpus 4-7 --max-hz 5 --gpu-sync turn --stats 10 --lights --lights-backend ncnn-cpu --lights-threads 2 --lights-cpus 4-7 --lights-hz 3 --lights-state /var/lib/roadsense/models/lights_state_bdd_48x24.onnx
 Restart=always
 RestartSec=2
 Nice=-5

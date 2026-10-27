@@ -52,7 +52,7 @@ if(NOT SIGND_ORT_INCLUDE_DIR OR NOT SIGND_ORT_LIBRARY)
   message(FATAL_ERROR "onnxruntime not found (set ONNXRUNTIME_ROOT)")
 endif()
 
-add_library(signd_core STATIC signd/yolo.cc signd/ort_runner.cc signd/tracker.cc signd/output.cc)
+add_library(signd_core STATIC signd/yolo.cc signd/ort_runner.cc signd/tracker.cc signd/output.cc signd/lights.cc)
 target_include_directories(signd_core PUBLIC ${CMAKE_SOURCE_DIR}/signd ${ROADSENSE_DIR}/camerad
   ${SIGND_ORT_INCLUDE_DIR})
 target_link_libraries(signd_core PUBLIC ${SIGND_ORT_LIBRARY})
@@ -106,4 +106,12 @@ else()
   message(STATUS "signd_replay: libjpeg not found, JPEG input disabled (PPM/PGM/NV12 only)")
 endif()
 
-install(TARGETS signd signd_replay RUNTIME DESTINATION bin)
+add_executable(lights_replay tools/lights_replay.cc)
+target_link_libraries(lights_replay PRIVATE signd_core)
+if(JPEG_FOUND)
+  target_compile_definitions(lights_replay PRIVATE SIGND_HAVE_LIBJPEG)
+  target_include_directories(lights_replay PRIVATE ${JPEG_INCLUDE_DIRS})
+  target_link_libraries(lights_replay PRIVATE ${JPEG_LIBRARIES})
+endif()
+
+install(TARGETS signd signd_replay lights_replay RUNTIME DESTINATION bin)

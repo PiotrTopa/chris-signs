@@ -6,6 +6,10 @@ class-agnostic YOLOv8n sign detector (384x640) and a 400-class Mapillary (MTSD)
 YOLOv8n-cls classifier on each box with ONNX Runtime on the CPU (or ncnn on the
 GPU through Vulkan, `--backend ncnn`), tracks signs with a SORT-style tracker,
 and publishes `signs` messages on a Unix socket that the roadsense api picks up.
+With `--lights` a second thread also detects traffic lights (BDD100K YOLO11n on the
+upper part of the frame, a small state CNN, a tracker) and publishes `lights`
+messages on `<rundir>/lightd.sock`; models and licences in
+[docs/LIGHT_MODELS.md](docs/LIGHT_MODELS.md), offline runs with `lights_replay`.
 
 Split out of roadsense at commit
 [`246e68a`](https://github.com/PiotrTopa/roadsense/commit/246e68a) (where it

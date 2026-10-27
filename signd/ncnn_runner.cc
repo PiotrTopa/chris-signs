@@ -31,10 +31,10 @@ int g_gpu_users = 0;  // the detector and the classifier share ncnn's global Vul
 
 class NcnnRunner : public ModelRunner {
 public:
-    explicit NcnnRunner(const RunnerOptions &opt) : out_n_(opt.output_size) {
+    explicit NcnnRunner(const RunnerOptions &opt) : out_n_(opt.output_size), cpu_(opt.backend == "ncnn-cpu") {
         if (opt.input_shape.size() != 4 || opt.input_shape[0] != 1)
             throw std::runtime_error("ncnn: input_shape must be [1,C,H,W]");
-        {
+        if (!cpu_) {
             std::lock_guard<std::mutex> lk(g_gpu_mu);
             if (g_gpu_users == 0 && opt.ncnn_flushall) {
                 const char *t = getenv("TU_DEBUG");
@@ -45,7 +45,7 @@ public:
             ++g_gpu_users;
         }
         const bool fp16 = opt.ncnn_fp16;
-        net_.opt.use_vulkan_compute = true;
+        net_.opt.use_vulkan_compute = !cpu_;
         net_.opt.use_fp16_packed = fp16;
         net_.opt.use_fp16_storage = fp16;
         net_.opt.use_fp16_arithmetic = fp16;
@@ -82,6 +82,11 @@ public:
             throw std::runtime_error("ncnn: " + opt.model + " outputs " + std::to_string(n) + " values, expected " +
                                      std::to_string(out_n_));
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (cpu_) {
+            fprintf(stderr, "signd: ncnn %s on the CPU (%d threads, fp16 %d), %zu output blob(s), warm-up %.0f ms\n",
+                    opt.model.c_str(), net_.opt.num_threads, int(fp16), outs_.size(), ms);
+            return;
+        }
         const ncnn::GpuInfo &gi = ncnn::get_gpu_info(ncnn::get_default_gpu_index());
         const char *td = getenv("TU_DEBUG");
         fprintf(stderr, "signd: ncnn %s on %s (fp16 packed %d, storage %d, arithmetic %d), TU_DEBUG=%s, %zu output blob(s), warm-up %.0f ms\n",
@@ -91,11 +96,12 @@ public:
 
     ~NcnnRunner() override {
         net_.clear();
+        if (cpu_) return;
         std::lock_guard<std::mutex> lk(g_gpu_mu);
         if (--g_gpu_users == 0) ncnn::destroy_gpu_instance();
     }
 
-    const char *name() const override { return "ncnn"; }
+    const char *name() const override { return cpu_ ? "ncnn-cpu" : "ncnn"; }
 
     void run(const float *in, float *out) override { run_hooked(in, out, nullptr); }
 
@@ -124,6 +130,27 @@ private:
     // round trip between them; one submit lets a GPU schedule hand the GPU over cleanly, roadsense
     // docs/lanes/L4-gpu-sched.md). Same layers, same download path as ncnn's extract: identical outputs.
     size_t extract(const std::function<void()> &before_submit = nullptr) {
+        if (cpu_) {  // CPU: plain extractor, no GPU schedule involved (the hook still runs, first)
+            if (before_submit) before_submit();
+            ncnn::Extractor ex = net_.create_extractor();
+            if (ex.input("in0", in_) != 0) throw std::runtime_error("ncnn: bad input in0");
+            size_t n = 0;
+            for (size_t i = 0; i < outs_.size(); ++i) {
+                ncnn::Mat m;
+                if (ex.extract(outs_[i].c_str(), m) != 0 || m.empty()) throw std::runtime_error("ncnn: extract " + outs_[i] + " failed");
+                if (m.elemsize != 4 || m.elempack != 1) {
+                    ncnn::Mat u;
+                    ncnn::convert_packing(m, u, 1, net_.opt);
+                    if (u.elemsize != 4) ncnn::cast_float16_to_float32(u, m, net_.opt);
+                    else m = u;
+                }
+                if (m.dims == 3 && m.c > 1 && m.cstep != size_t(m.w) * m.h)
+                    throw std::runtime_error("ncnn: padded 3-D output not supported");
+                outv_[i] = m.clone();
+                n += outv_[i].total();
+            }
+            return n;
+        }
         const ncnn::VulkanDevice *vkdev = net_.vulkan_device();
         ncnn::VkAllocator *blob_alloc = vkdev->acquire_blob_allocator();
         ncnn::VkAllocator *staging_alloc = vkdev->acquire_staging_allocator();
@@ -175,6 +202,7 @@ private:
     std::vector<ncnn::Mat> outv_;
     int c_ = 0, h_ = 0, w_ = 0;
     size_t out_n_ = 0;
+    bool cpu_ = false;  // backend "ncnn-cpu": ncnn's ARM/x86 CPU kernels, no Vulkan
 };
 
 }  // namespace

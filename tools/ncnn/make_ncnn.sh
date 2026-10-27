@@ -4,6 +4,7 @@
 #   usage: tools/ncnn/make_ncnn.sh MODELS_DIR [PYTHON_VENV]
 #   reads  MODELS_DIR/mtsd_signdet_yolov8n_384x640.onnx, MODELS_DIR/mtsd_signcls_yolov8n_64.onnx
 #   writes MODELS_DIR/mtsd_signdet_yolov8n_384x640-ncnn.{param,bin}, MODELS_DIR/mtsd_signcls_yolov8n_64-ncnn.{param,bin}
+#   and, if MODELS_DIR/bdd100k_yolo11n_320x960.onnx exists, bdd100k_yolo11n_320x960-ncnn.{param,bin} (lights)
 # Steps per model: onnxsim -> pnnx (ONNX -> ncnn, fp32 weights) -> tools/ncnn/fix_ncnn.py (detector
 # only: split the final Concat, see there). Needs onnx, onnxsim, pnnx (+ torch) in PYTHON_VENV
 # (default: roadsense's .venv-models next to this checkout, created by roadsense scripts/fetch-models.sh;
@@ -24,4 +25,7 @@ conv() { # stem inputshape fix(det|cls)
 }
 conv mtsd_signdet_yolov8n_384x640 "[1,3,384,640]" det
 conv mtsd_signcls_yolov8n_64 "[1,3,64,64]" cls
+# traffic lights (signd --lights): same YOLO head split (boxes out0, 10 class scores out1); its two MatMuls
+# (C2PSA attention) have no Vulkan kernel in ncnn and run on the CPU between GPU submits
+[ ! -f "$M/bdd100k_yolo11n_320x960.onnx" ] || conv bdd100k_yolo11n_320x960 "[1,3,320,960]" det
 sha256sum "$M"/*-ncnn.param "$M"/*-ncnn.bin

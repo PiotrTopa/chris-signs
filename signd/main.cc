@@ -2,6 +2,9 @@
 // CPU, or ncnn/Vulkan with --backend ncnn) -> SORT tracker -> `signs` JSON lines on <rundir>/signd.sock and best
 // crops in <rundir>/crops/<track_id>.jpg. Contract: roadsense docs/ARCHITECTURE.md,
 // models and pre/post-processing: docs/SIGN_MODELS.md.
+// With --lights a second thread runs the traffic-light pipeline (signd/lights.h, docs/LIGHT_MODELS.md) on its
+// own ring reader at --lights-hz and serves `lights` JSON lines on <rundir>/lightd.sock; on the GPU it takes
+// its own turns from modeld, serialised with the sign detector by a process mutex.
 //
 // Single thread (plus ORT's intra-op pool): take the NEWEST ring frame, run
 // the whole pipeline, publish, repeat. Frames that arrive meanwhile are
@@ -18,12 +21,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <mutex>
+#include <pthread.h>
 #include <sstream>
 #include <string>
 #include <thread>
 
 #include "gpusched.h"
 #include "jsonsock.h"
+#include "lights.h"
 #include "output.h"
 #include "ring.h"
 #include "tracker.h"
@@ -52,6 +58,13 @@ struct Options {
     std::string gpu_sync = "none";  // none | after | turn (roadsense docs/ARCHITECTURE.md, GPU schedule)
     std::string gpu_sched;          // default <rundir>/gpu.sched
     int gpu_sync_timeout_ms = 150;
+    // traffic lights (second thread)
+    bool lights = false;
+    LightsConfig lc;
+    LightTrackerConfig ltc;
+    double lights_hz = 3;
+    std::string lights_cpus;        // empty: same as --cpus
+    bool lights_timing = false;
 };
 
 std::string config_dir() {
@@ -149,6 +162,11 @@ void usage() {
             "  --gpu-sched PATH  GPU schedule file (default <rundir>/gpu.sched, created by modeld)\n"
             "  --gpu-sync-timeout MS  longest wait for modeld's tick (default 150); no wait if modeld is absent\n"
             "  --timing          add a non-contract \"timing\" object to every message\n"
+            "  --lights          also detect traffic lights (thread of its own, <rundir>/lightd.sock, `lights` topic)\n"
+            "  --lights-backend B  ncnn (GPU, default), ncnn-cpu or ort  --lights-model PATH  --lights-in WxH (960x320)\n"
+            "  --lights-roi x0,y0,x1,y1  frame fractions fed to the detector (default 0,0,1,0.62)\n"
+            "  --lights-hz X     light frames per second (default 3)  --lights-threads N (2)  --lights-cpus LIST\n"
+            "  --lights-thr X (0.25)  --lights-state rule|PATH.onnx (rule)  --lights-timing\n"
             "  --frames N        exit after N processed frames (testing)\n"
             "  --stats S         stderr stats interval in s (default 10, 0 = off)\n"
             "  --verbose\n"
@@ -189,6 +207,25 @@ void load_config(Options &o) {
     if (json_string(s, "gpu_sync", &str)) o.gpu_sync = str;
     if (json_string(s, "gpu_sched", &str)) o.gpu_sched = str;
     if (json_number(s, "gpu_sync_timeout_ms", &v)) o.gpu_sync_timeout_ms = int(v);
+    if (json_number(s, "lights", &v)) o.lights = v != 0;
+    if (json_string(s, "lights_backend", &str)) o.lc.backend = str;
+    if (json_string(s, "lights_model", &str)) o.lc.model = str;
+    if (json_string(s, "lights_state", &str)) o.lc.state = str;
+    if (json_string(s, "lights_cpus", &str)) o.lights_cpus = str;
+    if (json_number(s, "lights_hz", &v)) o.lights_hz = v;
+    if (json_number(s, "lights_threads", &v)) o.lc.threads = int(v);
+    if (json_number(s, "lights_thr", &v)) o.lc.det_thr = float(v);
+}
+
+bool parse_floats(const std::string &s, float *out, int n) {
+    const char *p = s.c_str();
+    for (int i = 0; i < n; ++i) {
+        char *e;
+        out[i] = strtof(p, &e);
+        if (e == p) return false;
+        p = *e == ',' ? e + 1 : e;
+    }
+    return true;
 }
 
 }  // namespace
@@ -233,6 +270,19 @@ int main(int argc, char **argv) {
         else if (a == "--gpu-sched") opt.gpu_sched = val();
         else if (a == "--gpu-sync-timeout") opt.gpu_sync_timeout_ms = atoi(val().c_str());
         else if (a == "--timing") opt.timing = true;
+        else if (a == "--lights") opt.lights = true;
+        else if (a == "--lights-backend") opt.lc.backend = val();
+        else if (a == "--lights-model") opt.lc.model = val();
+        else if (a == "--lights-in") {
+            if (sscanf(val().c_str(), "%dx%d", &opt.lc.in_w, &opt.lc.in_h) != 2) return usage(), 2;
+        } else if (a == "--lights-roi") {
+            if (!parse_floats(val(), opt.lc.roi, 4)) return usage(), 2;
+        } else if (a == "--lights-hz") opt.lights_hz = atof(val().c_str());
+        else if (a == "--lights-threads") opt.lc.threads = atoi(val().c_str());
+        else if (a == "--lights-cpus") opt.lights_cpus = val();
+        else if (a == "--lights-thr") opt.lc.det_thr = float(atof(val().c_str()));
+        else if (a == "--lights-state") opt.lc.state = val();
+        else if (a == "--lights-timing") opt.lights_timing = true;
         else if (a == "--frames") opt.max_frames = strtoull(val().c_str(), nullptr, 10);
         else if (a == "--stats") opt.stats_s = atof(val().c_str());
         else if (a == "--verbose" || a == "-v") opt.verbose = true;
@@ -294,6 +344,11 @@ int main(int argc, char **argv) {
     // GPU schedule (optional): align the detector with the end of a modeld run so it fills modeld's
     // CPU gap instead of stalling a modeld run halfway. Never blocks if modeld is not there.
     GpuSched gs;
+    // With lights on the GPU in turn mode both detectors take turns from modeld through `gs`; the mutex makes
+    // sure only one of them asks at a time (the shm has one want/turn pair).
+    std::mutex gpu_mu;
+    const bool lights_gpu_turn = opt.lights && opt.lc.backend == "ncnn" && opt.gpu_sync == "turn";
+    bool mu_held = false;
     bool turn_held = false;
     Clock::time_point turn_t0;
     uint64_t stats_ticks = 0, stats_turns = 0;
@@ -302,20 +357,130 @@ int main(int argc, char **argv) {
         const std::string gp = opt.gpu_sched.empty() ? rundir + "/gpu.sched" : opt.gpu_sched;
         gs.open(gp, false);  // may not exist yet: peer_alive() retries once per second
         const bool want_turn = opt.gpu_sync == "turn";
-        pipe->before_det = [&gs, &turn_held, &turn_t0, &stats_ticks, &stats_turns, &opt, want_turn] {
+        pipe->before_det = [&gs, &turn_held, &turn_t0, &stats_ticks, &stats_turns, &opt, want_turn, &gpu_mu, &mu_held,
+                            lights_gpu_turn] {
+            if (lights_gpu_turn) gpu_mu.lock(), mu_held = true;
             bool tick = false;
             turn_held = gs.wait_run_end(opt.gpu_sync_timeout_ms, want_turn, &tick);
             turn_t0 = Clock::now();
             stats_ticks += tick;
             stats_turns += turn_held;
         };
-        pipe->after_det = [&gs, &turn_held, &turn_t0] {
+        pipe->after_det = [&gs, &turn_held, &turn_t0, &gpu_mu, &mu_held] {
             if (turn_held) gs.end_turn(std::chrono::duration<double, std::milli>(Clock::now() - turn_t0).count());
             turn_held = false;
+            if (mu_held) mu_held = false, gpu_mu.unlock();
         };
         fprintf(stderr, "signd: GPU sync %s via %s (timeout %d ms)\n", opt.gpu_sync.c_str(), gp.c_str(),
                 opt.gpu_sync_timeout_ms);
     }
+
+    // ---- traffic lights: own thread, own ring reader, own socket
+    if (opt.lc.models_dir.empty() || opt.lc.models_dir == LightsConfig().models_dir) opt.lc.models_dir = opt.pc.models_dir;
+    auto lights_main = [&]() {
+        const std::string lcpus = opt.lights_cpus.empty() ? opt.cpus : opt.lights_cpus;
+        if (!lcpus.empty() && lcpus != "none") {
+            cpu_set_t set;
+            if (parse_cpus(lcpus, &set)) pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+        }
+        std::unique_ptr<LightPipeline> lp;
+        try {
+            lp = std::make_unique<LightPipeline>(opt.lc);
+        } catch (const std::exception &e) {
+            fprintf(stderr, "signd: lights disabled: %s\n", e.what());
+            return;
+        }
+        fprintf(stderr, "signd: lights: %s on %s, input %dx%d, roi %.2f,%.2f,%.2f,%.2f, %.1f Hz, state %s, cpus %s%s\n",
+                lp->config().model.c_str(), lp->backend(), opt.lc.in_w, opt.lc.in_h, opt.lc.roi[0], opt.lc.roi[1],
+                opt.lc.roi[2], opt.lc.roi[3], opt.lights_hz, opt.lc.state.c_str(), lcpus.c_str(),
+                lights_gpu_turn ? ", GPU turns" : "");
+        bool l_mu = false, l_turn = false;
+        uint64_t l_turns = 0;
+        Clock::time_point l_t0;
+        if (lights_gpu_turn) {
+            lp->before_det = [&] {
+                gpu_mu.lock();
+                l_mu = true;
+                bool tick = false;
+                l_turn = gs.wait_run_end(opt.gpu_sync_timeout_ms, true, &tick);
+                l_turns += l_turn;
+                l_t0 = Clock::now();
+            };
+            // end_turn(0): the shared det_ms (modeld's lead) stays the sign detector's; for the shorter light
+            // detector modeld simply waits for the turn to come back.
+            lp->after_det = [&] {
+                if (l_turn) gs.end_turn(0);
+                l_turn = false;
+                if (l_mu) l_mu = false, gpu_mu.unlock();
+            };
+        }
+        JsonLineServer lsrv;
+        std::string lerr;
+        if (!lsrv.listen(rundir + "/lightd.sock", &lerr)) {
+            fprintf(stderr, "signd: lights: %s\n", lerr.c_str());
+            return;
+        }
+        LightTracker lt(opt.ltc);
+        RingReader lr(ring_path());
+        FrameView lf;
+        std::vector<LightDet> ld;
+        std::vector<LightTrackReport> lrep;
+        uint64_t l_last = 0, l_n = 0;
+        double l_ms = 0, l_det = 0, l_wait = 0;
+        auto l_stats_t0 = Clock::now(), l_next = Clock::now();
+        const auto period = std::chrono::microseconds(int64_t(1e6 / std::max(0.1, opt.lights_hz)));
+        while (g_run) {
+            if (!lr.is_open() && !lr.open()) {
+                lsrv.service();
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                continue;
+            }
+            const auto now = Clock::now();
+            if (now < l_next) {
+                lsrv.service();
+                std::this_thread::sleep_for(std::min(l_next - now, Clock::duration(std::chrono::milliseconds(20))));
+                continue;
+            }
+            if (!lr.next(lf, 200)) {
+                lsrv.service();
+                continue;
+            }
+            l_next = Clock::now() + period;
+            if (lf.seq < l_last) lt.reset();
+            l_last = lf.seq;
+            if (lf.format != kFormatNV12 || (lf.width & 1) || (lf.height & 1)) continue;
+            Nv12View v;
+            v.y = lf.y, v.uv = lf.uv, v.width = int(lf.width), v.height = int(lf.height);
+            v.y_stride = int(lf.y_stride), v.uv_stride = int(lf.uv_stride);
+            LightsTiming t;
+            try {
+                lp->process(v, ld, &t);
+            } catch (const std::exception &e) {
+                if (l_turn) gs.end_turn(0), l_turn = false;
+                if (l_mu) l_mu = false, gpu_mu.unlock();
+                fprintf(stderr, "signd: lights failed: %s\n", e.what());
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+            const auto tt0 = Clock::now();
+            lt.update(lf.seq, lf.ts_mono_ns, ld, lrep);
+            const double ms = t.total_ms + std::chrono::duration<double, std::milli>(Clock::now() - tt0).count();
+            lsrv.publish(lights_json(lf.seq, lf.ts_mono_ns, lf.ts_real_ns, ms, v.width, v.height, lp->config(), lrep,
+                                     opt.lights_timing ? &ld : nullptr, opt.lights_timing ? &t : nullptr));
+            ++l_n, l_ms += ms, l_det += t.det_ms, l_wait += t.wait_ms;
+            const double el = std::chrono::duration<double>(Clock::now() - l_stats_t0).count();
+            if (opt.stats_s > 0 && el >= opt.stats_s) {
+                fprintf(stderr, "signd: lights %.2f fps, lights_ms %.1f (det %.1f), gpu wait %.1f ms, turns %llu, live %zu, clients %zu\n",
+                        l_n / el, l_ms / std::max<uint64_t>(1, l_n), l_det / std::max<uint64_t>(1, l_n),
+                        l_wait / std::max<uint64_t>(1, l_n), (unsigned long long)l_turns, lt.live(), lsrv.client_count());
+                l_stats_t0 = Clock::now();
+                l_n = 0, l_ms = l_det = l_wait = 0, l_turns = 0;
+            }
+        }
+        lsrv.close();
+    };
+    std::thread lights_thread;
+    if (opt.lights) lights_thread = std::thread(lights_main);
 
     Tracker tracker(opt.tc, pipe->names());
     RingReader rr(ring_path());
@@ -387,6 +552,7 @@ int main(int argc, char **argv) {
             pipe->process(v, dets, &t);
         } catch (const std::exception &e) {
             if (turn_held) gs.end_turn(), turn_held = false;
+            if (mu_held) mu_held = false, gpu_mu.unlock();
             fprintf(stderr, "signd: inference failed: %s\n", e.what());
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             continue;
@@ -431,6 +597,8 @@ int main(int argc, char **argv) {
     tracker.flush(ended);
     if (!ended.empty()) publish(last_meta, 0.0, nullptr);
     srv.close();
+    g_run = false;
+    if (lights_thread.joinable()) lights_thread.join();
     fprintf(stderr, "signd: exit after %llu frames\n", (unsigned long long)processed);
     return 0;
 }

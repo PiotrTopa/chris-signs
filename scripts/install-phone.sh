@@ -22,10 +22,16 @@ if [ -n "${NCNN_DIR:-}" ]; then
 fi
 cmake -S . -B "$BUILD" -DCMAKE_BUILD_TYPE=Release -DROADSENSE_DIR="$ROADSENSE_DIR" $NCNN_ARGS >/dev/null
 cmake --build "$BUILD" -j"$(nproc)"
-install -m 755 "$BUILD/signd" "$BUILD/signd_replay" /usr/local/bin/
+install -m 755 "$BUILD/signd" "$BUILD/signd_replay" "$BUILD/lights_replay" /usr/local/bin/
 mkdir -p /var/lib/roadsense/models /etc/roadsense
 install -m 644 models/mtsd_*.onnx models/mtsd_*_classes.txt /var/lib/roadsense/models/
 [ -z "${NCNN_DIR:-}" ] || install -m 644 models/mtsd_*-ncnn.param models/mtsd_*-ncnn.bin /var/lib/roadsense/models/
+# traffic lights (optional, signd --lights): detector + class list; the state CNN (lights_state_bdd_48x24.onnx,
+# tools/lights/train_state.py) is installed by hand if present (research-licensed training data)
+for m in models/bdd100k_yolo11n_*.onnx models/bdd100k_yolo11n_*-ncnn.param models/bdd100k_yolo11n_*-ncnn.bin \
+         models/bdd100k_classes.txt models/lights_state_bdd_48x24.onnx; do
+    [ ! -f "$m" ] || install -m 644 "$m" /var/lib/roadsense/models/
+done
 install -m 644 systemd/roadsense-signd.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable roadsense-signd.service >/dev/null

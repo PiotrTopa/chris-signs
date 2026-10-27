@@ -172,6 +172,9 @@ int Tracker::merged_index(const Track &t) const {
 
 const char *Tracker::suppress_reason(const Track &t, int k) const {
     if (k < 0) return nullptr;
+    // Classifiers trained with a "not a sign" class (roadsense L12, docs/SIGN_MODELS.md section 7) vote it like
+    // any other class; a track whose vote is `background` is reported flagged, never as a sign.
+    if (names_.merged[size_t(k)] == "background") return "not_a_sign";
     if (red_merged_[size_t(k)]) {
         const bool verified = t.n_verified >= cfg_.verify_min;
         if (verified && t.verify_sum < cfg_.verify_thr * t.n_verified) return "verifier";

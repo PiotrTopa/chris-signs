@@ -52,7 +52,8 @@ if(NOT SIGND_ORT_INCLUDE_DIR OR NOT SIGND_ORT_LIBRARY)
   message(FATAL_ERROR "onnxruntime not found (set ONNXRUNTIME_ROOT)")
 endif()
 
-add_library(signd_core STATIC signd/yolo.cc signd/ort_runner.cc signd/tracker.cc signd/output.cc signd/lights.cc)
+add_library(signd_core STATIC signd/yolo.cc signd/ort_runner.cc signd/tracker.cc signd/output.cc signd/lights.cc
+  signd/verify.cc)
 target_include_directories(signd_core PUBLIC ${CMAKE_SOURCE_DIR}/signd ${ROADSENSE_DIR}/camerad
   ${SIGND_ORT_INCLUDE_DIR})
 target_link_libraries(signd_core PUBLIC ${SIGND_ORT_LIBRARY})

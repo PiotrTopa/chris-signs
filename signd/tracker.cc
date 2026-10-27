@@ -1,5 +1,7 @@
 #include "tracker.h"
 
+#include "verify.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -133,6 +135,53 @@ void Tracker::Kalman::box(float out[4]) const {
 
 // ----------------------------------------------------------------- Tracker ---
 
+bool parse_class_min_score(const std::string &s, std::vector<std::pair<std::string, float>> *out) {
+    out->clear();
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t e = s.find(',', i);
+        if (e == std::string::npos) e = s.size();
+        const std::string item = s.substr(i, e - i);
+        const size_t eq = item.find('=');
+        if (eq == std::string::npos || eq == 0) return false;
+        char *end = nullptr;
+        const float v = strtof(item.c_str() + eq + 1, &end);
+        if (end == item.c_str() + eq + 1) return false;
+        out->emplace_back(item.substr(0, eq), v);
+        i = e + 1;
+    }
+    return true;
+}
+
+Tracker::Tracker(const TrackerConfig &cfg, const ClassNames &names) : cfg_(cfg), names_(names) {
+    red_merged_.assign(names_.merged.size(), 0);
+    min_score_merged_.assign(names_.merged.size(), 0.f);
+    for (size_t k = 0; k < names_.merged.size(); ++k) {
+        red_merged_[k] = is_round_red(names_.merged[k]);
+        size_t best_len = 0;
+        for (const auto &p : cfg_.class_min_score)
+            if (names_.merged[k].compare(0, p.first.size(), p.first) == 0 && p.first.size() >= best_len)
+                best_len = p.first.size(), min_score_merged_[k] = p.second;
+    }
+}
+
+int Tracker::merged_index(const Track &t) const {
+    if (t.nvotes == 0) return -1;
+    return int(std::max_element(t.votes.begin(), t.votes.end()) - t.votes.begin());
+}
+
+const char *Tracker::suppress_reason(const Track &t, int k) const {
+    if (k < 0) return nullptr;
+    if (red_merged_[size_t(k)]) {
+        const bool verified = t.n_verified >= cfg_.verify_min;
+        if (verified && t.verify_sum < cfg_.verify_thr * t.n_verified) return "verifier";
+        const bool glowing = t.n_glow_checked >= cfg_.glow_min && t.n_glow >= cfg_.glow_share * t.n_glow_checked;
+        if (glowing && (verified ? t.verify_sum < cfg_.verify_vouch * t.n_verified : cfg_.glow_alone)) return "glow";
+    }
+    if (t.best_score < min_score_merged_[size_t(k)]) return "score";
+    return nullptr;
+}
+
 void Tracker::classify(const Track &t, std::string *cls, int *cls_id) const {
     if (t.nvotes == 0) {  // detector saw a sign, classifier never confident
         *cls = "traffic-sign";
@@ -153,6 +202,10 @@ void Tracker::end(Track &t, std::vector<EndedTrack> &ended) {
     e.last_seq = t.last_seq;
     e.hits = t.hits;
     e.best_score = t.best_score;
+    e.reason = suppress_reason(t, merged_index(t));
+    e.suppressed = e.reason != nullptr;
+    e.glow_share = t.n_glow_checked ? float(t.n_glow) / float(t.n_glow_checked) : -1.f;
+    e.verify = t.n_verified ? t.verify_sum / float(t.n_verified) : -1.f;
     e.crop = std::move(t.crop);
     ended.push_back(std::move(e));
 }
@@ -221,6 +274,14 @@ void Tracker::update(uint64_t seq, const Nv12View &frame, const std::vector<Dete
             for (size_t k = 0; k < d.probs.size(); ++k) t.votes[size_t(names_.raw_to_merged[k])] += d.probs[k];
             ++t.nvotes;
         }
+        if (d.glow >= 0) {
+            ++t.n_glow_checked;
+            t.n_glow += d.glow >= cfg_.glow_px;
+        }
+        if (d.verify >= 0) {
+            ++t.n_verified;
+            t.verify_sum += d.verify;
+        }
         if (d.score > t.best_score) {
             t.best_score = d.score;
             const float mw = cfg_.crop_margin * (b[2] - b[0]), mh = cfg_.crop_margin * (b[3] - b[1]);
@@ -260,6 +321,10 @@ void Tracker::update(uint64_t seq, const Nv12View &frame, const std::vector<Dete
         r.box[3] = dets[j].y1;
         r.age = t.age;
         r.hits = t.hits;
+        r.reason = suppress_reason(t, merged_index(t));
+        r.suppressed = r.reason != nullptr;
+        r.glow_share = t.n_glow_checked ? float(t.n_glow) / float(t.n_glow_checked) : -1.f;
+        r.verify = t.n_verified ? t.verify_sum / float(t.n_verified) : -1.f;
         reports.push_back(std::move(r));
     }
     // Reap.

@@ -66,6 +66,10 @@ struct PipelineConfig {
     float nms_iou = 0.45f;
     int max_det = 100;
     float cls_margin = 0.0f;   // relative box padding before the classifier crop (reference: 0)
+    // Appearance checks on round red detections (verify.h): glow share always (cheap), plus the optional
+    // verifier CNN when verifier_model is set (ort; 32x32 RGB in, one logit out).
+    bool appearance = true;
+    std::string verifier_model;
     float min_box_px = 4.0f;   // drop degenerate boxes (frame px) before classifying
     // ORT intra-op busy-wait between ops (session.intra_op.allow_spinning). Off by
     // default: on the SD845 spinning made the detector slower (A55: 422 vs 323 ms,
@@ -82,11 +86,14 @@ struct Detection {
     int cls_raw = -1;       // classifier argmax (line in the classes file), -1 if not classified
     float cls_prob = 0.f;   // its probability
     std::vector<float> probs;  // full classifier output (empty if not classified)
+    float glow = -1.f;      // verify.h glow share; -1 = not checked (top-1 not a round red class)
+    float verify = -1.f;    // verifier probability "real sign"; -1 = no verifier / not checked
 };
 
 struct Timing {
     double pre_ms = 0, det_ms = 0, post_ms = 0, cls_ms = 0, total_ms = 0;
     double wait_ms = 0;  // time spent in the before-detector hook (GPU schedule), included in total_ms
+    double app_ms = 0;   // appearance checks (glow, verifier), included in cls_ms
 };
 
 // Class names: raw MTSD names (with --gN variant suffix) and the merged label
@@ -115,6 +122,7 @@ public:
     int input_h() const { return in_h_; }
     const char *det_backend() const { return det_->name(); }
     const char *cls_backend() const { return cls_->name(); }
+    bool has_verifier() const { return bool(ver_); }
     // Optional hooks around the detector run (signd: GPU turn-taking with modeld, roadsense
     // docs/ARCHITECTURE.md "GPU schedule"). before_det runs after the letterbox, at the last moment before
     // the detector's GPU work is submitted (ncnn: once its command buffer is recorded, ModelRunner::run_hooked);
@@ -122,7 +130,9 @@ public:
     std::function<void()> before_det, after_det;
 
 private:
-    std::unique_ptr<ModelRunner> det_, cls_;
+    std::unique_ptr<ModelRunner> det_, cls_, ver_;
+    std::vector<char> red_raw_;  // per raw class: round red (verify.h)
+    std::vector<float> app_in_;
     PipelineConfig cfg_;
     ClassNames names_;
     int lb_w_ = -1, lb_h_ = -1;  // letterbox content size of the last frame

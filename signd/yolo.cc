@@ -1,7 +1,10 @@
 #include "yolo.h"
 
+#include "verify.h"
+
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cmath>
 #include <fstream>
 #include <map>
@@ -311,6 +314,21 @@ SignPipeline::SignPipeline(const PipelineConfig &cfg) : cfg_(cfg) {
     ro.input_shape = {1, 3, cls_s_, cls_s_};
     ro.output_size = size_t(n_cls_);
     cls_ = make_runner(ro);
+    red_raw_.assign(names_.raw.size(), 0);
+    for (size_t i = 0; i < names_.raw.size(); ++i) red_raw_[i] = is_round_red(strip_variant(names_.raw[i]));
+    app_in_.assign(size_t(3) * kAppearanceSize * kAppearanceSize, 0.f);
+    if (!cfg_.verifier_model.empty() && !std::ifstream(cfg_.verifier_model).good()) {
+        // The verifier's weights are never shipped (non-commercial training data): a missing file is not fatal.
+        fprintf(stderr, "signd: verifier %s not found, running without it\n", cfg_.verifier_model.c_str());
+        cfg_.verifier_model.clear();
+    }
+    if (!cfg_.verifier_model.empty()) {
+        ro.backend = "ort";
+        ro.model = cfg_.verifier_model;
+        ro.input_shape = {1, 3, kAppearanceSize, kAppearanceSize};
+        ro.output_size = 1;
+        ver_ = make_runner(ro);
+    }
 
     det_in_.assign(size_t(3) * in_w_ * in_h_, 114.f / 255.f);
     det_out_.assign(size_t(n_out_) * n_anchor_, 0.f);
@@ -413,6 +431,18 @@ void SignPipeline::process(const Nv12View &f, std::vector<Detection> &out, Timin
         d.cls_raw = k;
         d.cls_prob = cls_out_[size_t(k)];
         d.probs = cls_out_;
+        if ((cfg_.appearance || ver_) && red_raw_[size_t(k)]) {
+            const auto ta = Clock::now();
+            nv12_region_to_rgb_planar(f, d.x0, d.y0, d.x1 - d.x0, d.y1 - d.y0, kAppearanceSize, kAppearanceSize,
+                                      app_in_.data(), kAppearanceSize, size_t(kAppearanceSize) * kAppearanceSize, 0, 0);
+            if (cfg_.appearance) d.glow = glow_score(app_in_.data(), kAppearanceSize);
+            if (ver_) {
+                float logit = 0.f;
+                ver_->run(app_in_.data(), &logit);
+                d.verify = 1.f / (1.f + std::exp(-logit));
+            }
+            t.app_ms += ms_since(ta);
+        }
     }
     t.cls_ms = ms_since(t3);
     t.total_ms = ms_since(t0);

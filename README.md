@@ -59,7 +59,10 @@ everything else keeps working. The systemd unit joins `roadsense.target`
 `seq`/`ts_*` are the frame ring's. Tracks are reported in `detections` once
 confirmed (`min_hits` 3) and end after `max_age` 10 processed frames without a
 match. The api serves them at `/v1/signs`, `/v1/signs/history` and draws them on
-`/preview`.
+`/preview`. Round red tracks (prohibitions, speed limits, stop) also carry `glow` / `verify` and, when signd
+judges them to be a stop lamp or traffic light (verifier CNN, glow, per-class minimum score), are reported
+flagged with `"suppressed": true, "reason": "..."` instead of being dropped
+([docs/SIGN_MODELS.md](docs/SIGN_MODELS.md) section 6).
 
 ## Numbers (Poco F1, Snapdragon 845)
 

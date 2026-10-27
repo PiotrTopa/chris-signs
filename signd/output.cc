@@ -124,7 +124,11 @@ std::string signs_json(const FrameMeta &m, double detect_ms, const std::vector<T
             if (k) o.push_back(',');
             num(o, d.box[k], 1);
         }
-        o += "],\"age\":" + std::to_string(d.age) + ",\"hits\":" + std::to_string(d.hits) + "}";
+        o += "],\"age\":" + std::to_string(d.age) + ",\"hits\":" + std::to_string(d.hits);
+        if (d.glow_share >= 0) o += ",\"glow\":", num(o, d.glow_share, 2);
+        if (d.verify >= 0) o += ",\"verify\":", num(o, d.verify, 2);
+        if (d.suppressed) o += ",\"suppressed\":true,\"reason\":\"" + std::string(d.reason) + "\"";
+        o.push_back('}');
     }
     o += "],\"tracks_ended\":[";
     for (size_t i = 0; i < ended.size(); ++i) {
@@ -141,6 +145,9 @@ std::string signs_json(const FrameMeta &m, double detect_ms, const std::vector<T
             esc(o, crop_paths[i]);
         else
             o += "null";
+        if (e.glow_share >= 0) o += ",\"glow\":", num(o, e.glow_share, 2);
+        if (e.verify >= 0) o += ",\"verify\":", num(o, e.verify, 2);
+        if (e.suppressed) o += ",\"suppressed\":true,\"reason\":\"" + std::string(e.reason) + "\"";
         o.push_back('}');
     }
     o.push_back(']');
@@ -167,6 +174,8 @@ std::string signs_json(const FrameMeta &m, double detect_ms, const std::vector<T
             num(o, d.score, 3);
             o += ",\"cls_prob\":";
             num(o, d.cls_prob, 3);
+            if (d.glow >= 0) o += ",\"glow\":", num(o, d.glow, 3);
+            if (d.verify >= 0) o += ",\"verify\":", num(o, d.verify, 3);
             o += ",\"box\":[";
             const float bx[4] = {d.x0, d.y0, d.x1, d.y1};
             for (int k = 0; k < 4; ++k) {

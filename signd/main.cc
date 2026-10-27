@@ -155,6 +155,12 @@ void usage() {
             "  --min-hits N      tracker: hits before a track is reported (default 3)\n"
             "  --iou-match X     tracker: min IoU to associate (default 0.1)\n"
             "  --crop-margin X   relative margin of the saved best crop (default 0.15)\n"
+            "  --no-appearance   skip the glow check on round red detections (default on)\n"
+            "  --verifier PATH   sign/lamp verifier .onnx (32x32 RGB -> logit) for round red detections (default none)\n"
+            "  --glow-px X (0.10) --glow-share X (0.5) --verify-thr X (0.3) --verify-vouch X (0.9)   round red track\n"
+            "                    suppression: verifier mean < thr, or glowing and verifier mean < vouch\n"
+            "  --glow-alone      glowing tracks are suppressed without a verifier too (default: only with one)\n"
+            "  --class-min-score LIST  prefix=min best detector score,... (e.g. regulatory--no-entry=0.7)\n"
             "  --max-crops N     keep at most N crop files written by this process (default 500, 0 = unlimited)\n"
             "  --max-hz X        process at most X frames/s (duty cycle; default 0 = as fast as possible)\n"
             "  --gpu-sync M      none (default): ignore modeld; after: start each detector run right after a modeld\n"
@@ -172,7 +178,8 @@ void usage() {
             "  --verbose\n"
             "config: $ROADSENSE_CONFIG_DIR (default /etc/roadsense)/signd.json, keys backend, det_backend, cls_backend,\n"
             "        models_dir, det_model, cls_model, cls_names, threads, cpus, nice, spin, ncnn_fp16, ncnn_flushall,\n"
-            "        det_thr, cls_gate, nms_iou, cls_margin, max_age, min_hits, iou_match, crop_margin, max_crops, max_hz (CLI wins)\n"
+            "        det_thr, cls_gate, nms_iou, cls_margin, max_age, min_hits, iou_match, crop_margin, max_crops, max_hz,\n"
+            "        appearance, verifier, glow_px, glow_share, glow_alone, verify_thr, verify_vouch, class_min_score (CLI wins)\n"
             "env: ROADSENSE_RUNDIR (default /run/roadsense), ROADSENSE_RING (default /dev/shm/roadsense-frames)\n");
 }
 
@@ -204,6 +211,15 @@ void load_config(Options &o) {
     if (json_number(s, "crop_margin", &v)) o.tc.crop_margin = float(v);
     if (json_number(s, "max_crops", &v)) o.max_crops = size_t(v);
     if (json_number(s, "max_hz", &v)) o.max_hz = v;
+    if (json_number(s, "appearance", &v)) o.pc.appearance = v != 0;
+    if (json_string(s, "verifier", &str)) o.pc.verifier_model = str;
+    if (json_number(s, "glow_px", &v)) o.tc.glow_px = float(v);
+    if (json_number(s, "glow_share", &v)) o.tc.glow_share = float(v);
+    if (json_number(s, "glow_alone", &v)) o.tc.glow_alone = v != 0;
+    if (json_number(s, "verify_vouch", &v)) o.tc.verify_vouch = float(v);
+    if (json_number(s, "verify_thr", &v)) o.tc.verify_thr = float(v);
+    if (json_string(s, "class_min_score", &str) && !parse_class_min_score(str, &o.tc.class_min_score))
+        fprintf(stderr, "signd: bad class_min_score in signd.json\n");
     if (json_string(s, "gpu_sync", &str)) o.gpu_sync = str;
     if (json_string(s, "gpu_sched", &str)) o.gpu_sched = str;
     if (json_number(s, "gpu_sync_timeout_ms", &v)) o.gpu_sync_timeout_ms = int(v);
@@ -264,6 +280,19 @@ int main(int argc, char **argv) {
         else if (a == "--min-hits") opt.tc.min_hits = atoi(val().c_str());
         else if (a == "--iou-match") opt.tc.iou_match = float(atof(val().c_str()));
         else if (a == "--crop-margin") opt.tc.crop_margin = float(atof(val().c_str()));
+        else if (a == "--no-appearance") opt.pc.appearance = false;
+        else if (a == "--verifier") opt.pc.verifier_model = val();
+        else if (a == "--glow-px") opt.tc.glow_px = float(atof(val().c_str()));
+        else if (a == "--glow-share") opt.tc.glow_share = float(atof(val().c_str()));
+        else if (a == "--glow-alone") opt.tc.glow_alone = true;
+        else if (a == "--verify-vouch") opt.tc.verify_vouch = float(atof(val().c_str()));
+        else if (a == "--verify-thr") opt.tc.verify_thr = float(atof(val().c_str()));
+        else if (a == "--class-min-score") {
+            if (!parse_class_min_score(val(), &opt.tc.class_min_score)) {
+                fprintf(stderr, "bad --class-min-score (prefix=score,...)\n");
+                return 2;
+            }
+        }
         else if (a == "--max-crops") opt.max_crops = size_t(atol(val().c_str()));
         else if (a == "--max-hz") opt.max_hz = atof(val().c_str());
         else if (a == "--gpu-sync") opt.gpu_sync = val();
@@ -321,6 +350,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "signd: model load failed: %s\n", e.what());
         return 1;
     }
+    fprintf(stderr,
+            "signd: round red checks: glow %s (px %.2f share %.2f%s), verifier %s (thr %.2f vouch %.2f), %zu class min scores\n",
+            opt.pc.appearance ? "on" : "off", opt.tc.glow_px, opt.tc.glow_share, opt.tc.glow_alone ? ", alone" : "",
+            pipe->has_verifier() ? opt.pc.verifier_model.c_str() : "none", opt.tc.verify_thr, opt.tc.verify_vouch,
+            opt.tc.class_min_score.size());
     fprintf(stderr,
             "signd: detector %dx%d on %s (%s), classifier on %s (%s), %zu classes (%zu merged), %d threads on cpus %s, "
             "det_thr %.2f cls_gate %.2f nms %.2f\n",

@@ -219,6 +219,12 @@ void usage() {
             "  --max-frames N    stop after N processed frames (default: all)\n"
             "  --det-thr X (0.35) --cls-gate X (0.6) --nms-iou X (0.45) --cls-margin X (0)\n"
             "  --max-age N (10)  --min-hits N (3)  --iou-match X (0.1)  --crop-margin X (0.15)\n"
+            "  --no-appearance   skip the glow check on round red detections (default on)\n"
+            "  --verifier PATH   sign/lamp verifier .onnx (32x32 RGB -> logit) for round red detections (default none)\n"
+            "  --glow-px X (0.10) --glow-share X (0.5) --verify-thr X (0.3) --verify-vouch X (0.9)   round red track\n"
+            "                    suppression: verifier mean < thr, or glowing and verifier mean < vouch\n"
+            "  --glow-alone      glowing tracks are suppressed without a verifier too (default: only with one)\n"
+            "  --class-min-score LIST  prefix=min best detector score,... (e.g. regulatory--no-entry=0.7)\n"
             "  --repeat N        feed every file N times (default 1)\n"
             "  --reset-each      end all tracks after each file (default: files are one sequence)\n"
             "  --raw             add the per-frame detections before tracking (\"raw\", not in the contract)\n"
@@ -271,6 +277,19 @@ int main(int argc, char **argv) {
         else if (a == "--min-hits") tc.min_hits = atoi(val().c_str());
         else if (a == "--iou-match") tc.iou_match = float(atof(val().c_str()));
         else if (a == "--crop-margin") tc.crop_margin = float(atof(val().c_str()));
+        else if (a == "--no-appearance") pc.appearance = false;
+        else if (a == "--verifier") pc.verifier_model = val();
+        else if (a == "--glow-px") tc.glow_px = float(atof(val().c_str()));
+        else if (a == "--glow-share") tc.glow_share = float(atof(val().c_str()));
+        else if (a == "--glow-alone") tc.glow_alone = true;
+        else if (a == "--verify-vouch") tc.verify_vouch = float(atof(val().c_str()));
+        else if (a == "--verify-thr") tc.verify_thr = float(atof(val().c_str()));
+        else if (a == "--class-min-score") {
+            if (!parse_class_min_score(val(), &tc.class_min_score)) {
+                fprintf(stderr, "bad --class-min-score (prefix=score,...)\n");
+                return 2;
+            }
+        }
         else if (a == "--repeat") repeat = std::max(1, atoi(val().c_str()));
         else if (a == "--reset-each") reset_each = true;
         else if (a == "--raw") raw = true;

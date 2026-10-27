@@ -36,7 +36,26 @@ struct TrackerConfig {
     float dist_match = 1.0f;   // max centre distance / max(w,h) for the fallback pass
     float cls_gate = 0.6f;     // classifier probability needed for a vote
     float crop_margin = 0.15f; // relative margin around the box for the saved crop
+    // Acceptance (roadsense lane L8). A confirmed track is still reported, but flagged `suppressed` with a
+    // `reason` when its current class is a round red one (verify.h) and
+    //   verifier: >= verify_min verified detections with a mean probability < verify_thr, or
+    //   glow:     >= glow_min checked detections and a share >= glow_share of them had glow >= glow_px, and the
+    //             verifier is not sure either (mean < verify_vouch); without a verifier glow only suppresses
+    //             with glow_alone (off by default: by itself it also flags ~15 % of sunlit real signs, GTSRB);
+    // or (any class) its best detector score is below the class's minimum (class_min_score, prefix match on
+    // the merged name, longest prefix wins): reason "score" (can clear later as the sign gets closer).
+    float glow_px = 0.10f;
+    float glow_share = 0.5f;
+    int glow_min = 2;
+    bool glow_alone = false;
+    float verify_vouch = 0.9f;
+    float verify_thr = 0.3f;
+    int verify_min = 2;
+    std::vector<std::pair<std::string, float>> class_min_score;
 };
+
+// "prefix=0.7,prefix2=0.5" -> class_min_score; false on a syntax error.
+bool parse_class_min_score(const std::string &s, std::vector<std::pair<std::string, float>> *out);
 
 struct TrackReport {  // a confirmed track matched in the current frame
     int id;
@@ -45,6 +64,10 @@ struct TrackReport {  // a confirmed track matched in the current frame
     float score;
     float box[4];
     int age, hits;
+    bool suppressed = false;
+    const char *reason = nullptr;  // "glow" | "verifier" | "score" when suppressed
+    float glow_share = -1.f;       // share of checked detections that glowed (-1: none checked)
+    float verify = -1.f;           // mean verifier probability over the track (-1: none verified)
 };
 
 struct EndedTrack {
@@ -55,11 +78,15 @@ struct EndedTrack {
     int hits;
     float best_score;
     Nv12Image crop;
+    bool suppressed = false;
+    const char *reason = nullptr;
+    float glow_share = -1.f;
+    float verify = -1.f;
 };
 
 class Tracker {
 public:
-    Tracker(const TrackerConfig &cfg, const ClassNames &names) : cfg_(cfg), names_(names) {}
+    Tracker(const TrackerConfig &cfg, const ClassNames &names);
 
     // One processed frame. `frame` is used for the best crops.
     void update(uint64_t seq, const Nv12View &frame, const std::vector<Detection> &dets,
@@ -89,13 +116,20 @@ private:
         Nv12Image crop;
         std::vector<float> votes;  // per merged class
         int nvotes = 0;
+        int n_glow_checked = 0, n_glow = 0, n_verified = 0;
+        float verify_sum = 0;
     };
     void classify(const Track &t, std::string *cls, int *cls_id) const;
+    // Acceptance decision for the track's current class (merged index k, -1 = unclassified).
+    const char *suppress_reason(const Track &t, int k) const;
+    int merged_index(const Track &t) const;
     void end(Track &t, std::vector<EndedTrack> &ended);
 
     TrackerConfig cfg_;
     const ClassNames &names_;
     std::vector<Track> tracks_;
+    std::vector<char> red_merged_;
+    std::vector<float> min_score_merged_;
     int next_id_ = 1;
 };
 

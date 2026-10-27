@@ -166,3 +166,50 @@ Comparison images for the rejected models are `out/sss_*.jpg` (B), `out/by_*.jpg
 * **False positives:** red/white delineators and similar shapes can trigger the detector at low confidence. Use det conf ≥ 0.35.
 * **Evaluation size:** the qualitative check covers 6 photos (11 near/mid-range signs) and is not a benchmark. The quantitative figures are the authors' MTSD validation numbers.
 * **Latency on the SD845** was extrapolated here; the device measurements are at the top of this file.
+
+## 6. Round red acceptance: stop lamps and traffic lights (roadsense lane L8)
+
+On the Krakow replay about 10 of 13 `no-entry` tracks per loop were not signs: red traffic lights
+(~7) and a bus/tram stop-lamp bar (~3). At 640x384 a lit lamp (red glow around a blown-out white core)
+looks like B-2, and the closed-set classifier has no "other" class. signd therefore judges every track
+whose class is round red (`regulatory--no-*`, `maximum-speed-limit-*`, `road-closed*`, height/weight/
+width limits, `stop`; `signd/verify.h`) and flags it `suppressed` with a `reason` instead of dropping it
+(contract: roadsense `docs/ARCHITECTURE.md`, sign provider, "Flagged tracks"):
+
+| reason | rule (defaults) | flags |
+|---|---|---|
+| `verifier` | mean verifier probability over >= 2 detections < 0.3 | `--verifier PATH`, `--verify-thr` |
+| `glow` | >= half of >= 2 checked detections have glow >= 0.10 and the verifier mean < 0.9 (no verifier: only with `--glow-alone`) | `--glow-px`, `--glow-share`, `--verify-vouch`, `--glow-alone`, `--no-appearance` |
+| `score` | best detector score below the class minimum (any class, prefix match) | `--class-min-score regulatory--no-entry=0.71` |
+
+Glow (`glow_score()`): on the 32x32 resample of the box, the share of the inscribed ellipse that is blown
+out (min(R,G,B) >= 235) or bright desaturated red (R >= 220, 80 <= min < 235, R - min >= 40). It separates
+lamps from signs perfectly on the overcast Krakow ride, but sunlit real signs glow too (GTSRB: 15 % of
+physical round red signs would be flagged), hence it is gated by the verifier.
+
+### Verifier (`--verifier`)
+A 3-conv CNN (16/32/64 channels, ~24 k parameters), input `in` [1,3,32,32] = the detector box resampled
+to 32x32 (RGB /255, NCHW, same resampler as the classifier), output `logit` [1,1]; run with ORT on the CPU
+only for round red detections (< 0.1 ms each). Recipe (`tools/verifier/`, the dev box, not the phone):
+
+```
+tools/verifier/harvest_ride.py RIDE.mjpeg H/krakow             # signd mirror on every frame of the ride
+tools/verifier/link_tracks.py H/krakow                          # simple IoU tracks; label false ones by hand
+                                                                 # into H/krakow/labels_false.json {tid: lamp|light|other}
+tools/verifier/harvest_bdd.py BDD100K_VAL H/bdd                 # detector-mined RR detections vs BDD GT boxes
+tools/verifier/mine_bdd_blobs.py BDD100K_VAL H/bddblobs 4       # bright red blobs in car/truck/bus boxes
+tools/verifier/mine_bdd_blobs.py BDD100K_VAL H/bddlights 4 lights   # red traffic lights (GT colour R)
+tools/verifier/fetch_gtsrb.sh ~/datasets/gtsrb-zenodo           # positives
+tools/verifier/build_sets.py H ~/datasets/gtsrb-zenodo/data sets.npz
+tools/verifier/train_verifier.py sets.npz models/sign_verifier_32.onnx   # 12 epochs, ~5 min on 4 threads
+```
+`BDD100K_VAL` is the FiftyOne export of BDD100K val (`samples.json` + `data/`). Splits: BDD images by
+md5(id) (first hex digit >= c: test), GTSRB Train/Test, the ride by loop time (< 300 s train). Held-out
+share accepted as real (p >= 0.5), model trained on all train splits: BDD lamp blobs 0.5 %, BDD red-light
+blobs 0.0-1.2 %, ride lamps 0/384, ride lights 0/324, GTSRB Test round red 99.9 %, BDD real signs 91 %
+(night 86 %), ride real signs 99.7 % (per detection). Trained without any ride data: ride lamps/lights
+still 0 %, ride real signs 94.5 %.
+
+Data licences: BDD100K (non-commercial research licence), GTSRB (free to use with citation of Stallkamp
+et al., IJCNN 2011; Zenodo copy record 13741936 lists CC BY 4.0), Krakow ride (CC BY 3.0, Relaxing Roads
+4K via Wikimedia Commons). **The verifier weights are never committed**; the scripts are.

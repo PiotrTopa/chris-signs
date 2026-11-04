@@ -6,6 +6,7 @@ Wants=roadsense-camerad.service
 
 [Service]
 Type=simple
+Slice=roadsense.slice
 # Phase 1: root. The frame ring lives in /dev/shm and logind would remove a
 # normal user's shm segments at logout (RemoveIPC); a system user comes later.
 Environment=ROADSENSE_RUNDIR=/run/roadsense

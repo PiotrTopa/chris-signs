@@ -42,7 +42,10 @@ Purely over roadsense's documented IPC contract (roadsense
 
 If signd is not running the roadsense api reports it as not connected and
 everything else keeps working. The systemd unit joins `roadsense.target`
-(`PartOf=`, `WantedBy=`) without the target depending on it.
+(`PartOf=`, `WantedBy=`) without the target depending on it, and runs in
+roadsense's `roadsense.slice` (`Slice=`) so the host that starts and stops the
+target (on the Prius car computer: the car backend, on ACC) can bound the whole
+stack's CPU and memory as one group.
 
 ### The `signs` message (one per processed frame)
 

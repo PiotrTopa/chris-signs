@@ -9,3 +9,9 @@ __pycache__/
 *.pyc
 models/*.param
 models/*.bin
+# map data and map packs are never committed (roadsense docs/MAPS.md)
+*.rsmap
+*.osm.pbf
+*.pbf
+*.osm
+roadsense-maps/

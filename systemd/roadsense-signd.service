@@ -44,7 +44,14 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/shm/roadsense-frames
 # the file signd does not start; drop --cls/--cls-names to fall back to the original classifier); tracks voted
 # `background` are flagged `not_a_sign`; --dist-match-new 2.0 lets a one-hit track follow a small sign that moves more
 # than its width between 5 Hz frames (the krakow B-33 70 and the s1 D-7 were detected but never tracked).
-ExecStart=/usr/local/bin/signd --det-backend ncnn --cls-backend ort --threads 2 --cpus 4-7 --max-hz 5 --gpu-sync turn --stats 10 --lights --lights-backend ncnn-cpu --lights-threads 2 --lights-cpus 4-7 --lights-hz 3 --lights-state /var/lib/roadsense/models/lights_state_bdd_48x24.onnx --verifier /var/lib/roadsense/models/sign_verifier_32.onnx --class-min-score regulatory--no-entry=0.71 --cls /var/lib/roadsense/models/mtsd_signcls_l12_64.onnx --cls-names /var/lib/roadsense/models/mtsd_signcls_l12_classes.txt --dist-match-new 2.0
+# L15 (roadsense docs/lanes/L15-stability.md, 2026-11-16): lights that were there and not reported. --lights-roi2: every
+# other light frame looks at the middle 960x320 pixels around the horizon at scale 1.0 instead of the wide band at 0.72
+# (far lights; same number of detector runs, so the same cost); --lights-thr-keep 0.12: weak boxes continue a track and
+# never start one; --lights-coast 2: a confirmed track stays in the message for two more light frames after its last
+# match (flagged `coast`). krakow-night-tunnel replay at 2.9 Hz: reported share of the light-time 82 -> 94 %, of the
+# lights under 12 px 39 -> 81 %, drop-outs 4.8 -> 1.6 per minute of light-time. The roi2 rows assume the horizon near the
+# middle of the frame (the car's DVR camera, pitch not calibrated): adjust with the camera's pitch.
+ExecStart=/usr/local/bin/signd --det-backend ncnn --cls-backend ort --threads 2 --cpus 4-7 --max-hz 5 --gpu-sync turn --stats 10 --lights --lights-backend ncnn-cpu --lights-threads 2 --lights-cpus 4-7 --lights-hz 3 --lights-roi2 0.125,0.125,0.875,0.569 --lights-thr-keep 0.12 --lights-coast 2 --lights-state /var/lib/roadsense/models/lights_state_bdd_48x24.onnx --verifier /var/lib/roadsense/models/sign_verifier_32.onnx --class-min-score regulatory--no-entry=0.71 --cls /var/lib/roadsense/models/mtsd_signcls_l12_64.onnx --cls-names /var/lib/roadsense/models/mtsd_signcls_l12_classes.txt --dist-match-new 2.0
 Restart=always
 RestartSec=2
 Nice=-5

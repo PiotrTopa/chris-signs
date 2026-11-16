@@ -172,17 +172,18 @@ void LightPipeline::classify(const Nv12View &f, LightDet &d) {
     // glare (L7 report): the tracker infers it from the sequence instead (yellow right after red).
 }
 
-void LightPipeline::process(const Nv12View &f, std::vector<LightDet> &out, LightsTiming *tm) {
+void LightPipeline::process(const Nv12View &f, std::vector<LightDet> &out, LightsTiming *tm, int view) {
     out.clear();
     LightsTiming t;
     const auto t0 = Clock::now();
-    const double rx0 = std::floor(cfg_.roi[0] * f.width), ry0 = std::floor(cfg_.roi[1] * f.height);
-    const double rx1 = std::ceil(cfg_.roi[2] * f.width), ry1 = std::ceil(cfg_.roi[3] * f.height);
+    const float *roi = view_roi(view);
+    const double rx0 = std::floor(roi[0] * f.width), ry0 = std::floor(roi[1] * f.height);
+    const double rx1 = std::ceil(roi[2] * f.width), ry1 = std::ceil(roi[3] * f.height);
     const double rw = std::max(2.0, rx1 - rx0), rh = std::max(2.0, ry1 - ry0);
     const double r = std::min(cfg_.in_w / rw, cfg_.in_h / rh);
     const int nw = std::min(cfg_.in_w, int(std::lround(rw * r))), nh = std::min(cfg_.in_h, int(std::lround(rh * r)));
     const size_t plane = size_t(cfg_.in_w) * cfg_.in_h;
-    if (nw != lb_w_ || nh != lb_h_) {
+    if (nw != lb_w_ || nh != lb_h_) {  // the padding only changes with the view's letterbox
         std::fill(in_.begin(), in_.end(), 114.f / 255.f);
         lb_w_ = nw;
         lb_h_ = nh;
@@ -206,8 +207,9 @@ void LightPipeline::process(const Nv12View &f, std::vector<LightDet> &out, Light
     const size_t N = size_t(n_anchor_);
     const float *o = out_.data(), *sc = o + size_t(4 + cfg_.cls_id) * N;
     std::vector<LightDet> cand;
+    const float thr = cfg_.det_thr_keep > 0 ? std::min(cfg_.det_thr, cfg_.det_thr_keep) : cfg_.det_thr;
     for (size_t i = 0; i < N; ++i) {
-        if (!(sc[i] > cfg_.det_thr)) continue;
+        if (!(sc[i] > thr)) continue;
         const float cx = o[i], cy = o[N + i], w = o[2 * N + i], h = o[3 * N + i];
         LightDet d;
         d.x0 = float(rx0 + (cx - w / 2) / r);
@@ -284,12 +286,18 @@ bool LightTracker::flashing(const Track &t, int64_t ts) const {
     return ny >= 2 && no >= 2 && changes >= 3;
 }
 
-void LightTracker::update(uint64_t, int64_t ts, const std::vector<LightDet> &dets, std::vector<LightTrackReport> &out) {
+void LightTracker::update(uint64_t, int64_t ts, const std::vector<LightDet> &dets, std::vector<LightTrackReport> &out,
+                          const float *seen) {
     out.clear();
     for (Track &t : tracks_) {  // constant-velocity prediction of the box centre
         t.box[0] += t.v[0], t.box[2] += t.v[0], t.box[1] += t.v[1], t.box[3] += t.v[1];
-        ++t.age, ++t.since;
+        ++t.age, ++t.steps;
+        // A track outside the part of the frame the detector looked at this time cannot be matched: it moves
+        // on with its velocity and is not counted as missed.
+        const float cx = (t.box[0] + t.box[2]) / 2, cy = (t.box[1] + t.box[3]) / 2;
+        if (!seen || (cx >= seen[0] && cx <= seen[2] && cy >= seen[1] && cy <= seen[3])) ++t.since;
     }
+    const auto weak = [&](const LightDet &d) { return cfg_.new_score > 0 && d.score < cfg_.new_score; };
     std::vector<int> match(dets.size(), -1);
     std::vector<char> used(tracks_.size(), 0);
     struct P { float s; size_t d, t; };
@@ -311,7 +319,7 @@ void LightTracker::update(uint64_t, int64_t ts, const std::vector<LightDet> &det
             if (used[j]) continue;
             const float *b = tracks_[j].box;
             const float d = std::hypot((b[0] + b[2]) / 2 - cx, (b[1] + b[3]) / 2 - cy) / std::max(sz, 1.f);
-            if (d <= cfg_.dist_match) pairs.push_back({-d, i, j});
+            if (d <= (weak(dets[i]) ? cfg_.dist_match_weak : cfg_.dist_match)) pairs.push_back({-d, i, j});
         }
     }
     std::sort(pairs.begin(), pairs.end(), [](const P &a, const P &b) { return a.s > b.s; });
@@ -324,17 +332,18 @@ void LightTracker::update(uint64_t, int64_t ts, const std::vector<LightDet> &det
             Track &t = tracks_[size_t(match[i])];
             const float ocx = (t.box[0] + t.box[2]) / 2 - t.v[0], ocy = (t.box[1] + t.box[3]) / 2 - t.v[1];
             const float ncx = (d.x0 + d.x1) / 2, ncy = (d.y0 + d.y1) / 2;
-            const float k = t.since > 0 ? 1.f / t.since : 1.f;
+            const float k = t.steps > 0 ? 1.f / t.steps : 1.f;  // frames since the last match
             t.v[0] = 0.5f * t.v[0] + 0.5f * (ncx - ocx) * k;
             t.v[1] = 0.5f * t.v[1] + 0.5f * (ncy - ocy) * k;
             t.box[0] = d.x0, t.box[1] = d.y0, t.box[2] = d.x1, t.box[3] = d.y1;
             t.score = d.score;
             t.horizontal = d.horizontal;
             ++t.hits;
-            t.since = 0;
+            t.since = 0, t.steps = 0;
             observe(t, ts, d);
             frame_state[size_t(match[i])] = d.state;
         } else {
+            if (weak(d)) continue;  // a weak box never starts a track
             Track t;
             t.id = next_id_++;
             t.box[0] = d.x0, t.box[1] = d.y0, t.box[2] = d.x1, t.box[3] = d.y1;
@@ -350,14 +359,16 @@ void LightTracker::update(uint64_t, int64_t ts, const std::vector<LightDet> &det
     std::vector<Track> keep;
     std::vector<int> keep_fs;
     for (size_t j = 0; j < tracks_.size(); ++j) {
-        if (tracks_[j].since > cfg_.max_age) continue;
+        // missed too often where it could be seen, or out of every view for long
+        if (tracks_[j].since > cfg_.max_age || tracks_[j].steps > 3 * cfg_.max_age) continue;
         keep.push_back(std::move(tracks_[j]));
         keep_fs.push_back(frame_state[j]);
     }
     tracks_.swap(keep);
     for (size_t j = 0; j < tracks_.size(); ++j) {
         const Track &t = tracks_[j];
-        if (t.hits < cfg_.min_hits || t.since > 0) continue;  // report matched, confirmed tracks only
+        // confirmed tracks: matched in this frame, or coasting for at most report_coast frames
+        if (t.hits < cfg_.min_hits || t.steps > cfg_.report_coast) continue;
         LightTrackReport r;
         r.id = t.id;
         std::copy(t.box, t.box + 4, r.box);
@@ -366,6 +377,7 @@ void LightTracker::update(uint64_t, int64_t ts, const std::vector<LightDet> &det
         r.state = r.flashing ? kYellow : t.state;
         r.state_conf = t.state_conf;
         r.frame_state = keep_fs[j];
+        r.coast = t.steps;
         r.horizontal = t.horizontal;
         r.hits = t.hits;
         r.age = t.age;
@@ -378,23 +390,26 @@ void LightTracker::update(uint64_t, int64_t ts, const std::vector<LightDet> &det
 
 std::string lights_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, double lights_ms, int frame_w,
                         int frame_h, const LightsConfig &cfg, const std::vector<LightTrackReport> &tracks,
-                        const std::vector<LightDet> *raw, const LightsTiming *tm) {
+                        const std::vector<LightDet> *raw, const LightsTiming *tm, int view) {
+    const bool v2 = cfg.roi2[2] > cfg.roi2[0] && cfg.roi2[3] > cfg.roi2[1];
+    const float *roi = view == 1 && v2 ? cfg.roi2 : cfg.roi;
     char b[512];
     snprintf(b, sizeof(b),
              "{\"type\":\"lights\",\"seq\":%" PRIu64 ",\"ts_mono_ns\":%" PRId64 ",\"ts_real_ns\":%" PRId64
-             ",\"lights_ms\":%s,\"frame\":[%d,%d],\"roi\":[%s,%s,%s,%s],\"lights\":[",
-             seq, ts_mono_ns, ts_real_ns, fmt(lights_ms, 1).c_str(), frame_w, frame_h, fmt(cfg.roi[0] * frame_w, 0).c_str(),
-             fmt(cfg.roi[1] * frame_h, 0).c_str(), fmt(cfg.roi[2] * frame_w, 0).c_str(), fmt(cfg.roi[3] * frame_h, 0).c_str());
+             ",\"lights_ms\":%s,\"frame\":[%d,%d],\"roi\":[%s,%s,%s,%s],\"view\":%d,\"lights\":[",
+             seq, ts_mono_ns, ts_real_ns, fmt(lights_ms, 1).c_str(), frame_w, frame_h, fmt(roi[0] * frame_w, 0).c_str(),
+             fmt(roi[1] * frame_h, 0).c_str(), fmt(roi[2] * frame_w, 0).c_str(), fmt(roi[3] * frame_h, 0).c_str(),
+             view == 1 && v2 ? 1 : 0);
     std::string s = b;
     for (size_t i = 0; i < tracks.size(); ++i) {
         const LightTrackReport &t = tracks[i];
         snprintf(b, sizeof(b),
                  "%s{\"track_id\":%d,\"state\":\"%s\",\"state_conf\":%s,\"state_s\":%s,\"frame_state\":\"%s\",\"flashing\":%s,"
-                 "\"score\":%s,\"box\":[%s,%s,%s,%s],\"horizontal\":%s,\"hits\":%d,\"age\":%d}",
+                 "\"score\":%s,\"box\":[%s,%s,%s,%s],\"horizontal\":%s,\"hits\":%d,\"age\":%d,\"coast\":%d}",
                  i ? "," : "", t.id, light_state_name(t.state), fmt(t.state_conf, 2).c_str(), fmt(t.state_s, 1).c_str(),
                  light_state_name(t.frame_state), t.flashing ? "true" : "false", fmt(t.score, 3).c_str(),
                  fmt(t.box[0], 1).c_str(), fmt(t.box[1], 1).c_str(), fmt(t.box[2], 1).c_str(), fmt(t.box[3], 1).c_str(),
-                 t.horizontal ? "true" : "false", t.hits, t.age);
+                 t.horizontal ? "true" : "false", t.hits, t.age, t.coast);
         s += b;
     }
     s += "]";

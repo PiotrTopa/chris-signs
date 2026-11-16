@@ -97,6 +97,8 @@ void usage() {
             "  --backend ncnn|ncnn-cpu|ort (ncnn)  --model PATH  --models-dir DIR  --in WxH (960x320)\n"
             "  --roi x0,y0,x1,y1  fractions of the frame (0,0,1,0.62)   --thr X (0.25)  --nms X (0.45)\n"
             "  --state rule|PATH.onnx (rule)   --threads N (2)   --cpus LIST (none)   --ncnn-fp32  --ncnn-no-flushall\n"
+            "  --roi2 x0,y0,x1,y1  second view on every other processed frame (none)   --thr-keep X (off)   --coast N (0)\n"
+            "  --dt-ms X  time between processed frames for the tracker (200)\n"
             "  --size WxH (raw NV12)  --every N (1)  --max-frames N  --repeat N  --no-track  --bench N (time N more passes)\n");
 }
 
@@ -121,6 +123,7 @@ int main(int argc, char **argv) {
     int raw_w = 0, raw_h = 0, every = 1, repeat = 1, bench = 0;
     uint64_t max_frames = 0;
     bool track = true;
+    double dt_ms = 200;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto val = [&]() -> std::string {
@@ -134,7 +137,12 @@ int main(int argc, char **argv) {
             if (sscanf(val().c_str(), "%dx%d", &lc.in_w, &lc.in_h) != 2) return usage(), 2;
         } else if (a == "--roi") {
             if (!parse_floats(val(), lc.roi, 4)) return usage(), 2;
+        } else if (a == "--roi2") {
+            if (!parse_floats(val(), lc.roi2, 4)) return usage(), 2;
         } else if (a == "--thr") lc.det_thr = float(atof(val().c_str()));
+        else if (a == "--thr-keep") lc.det_thr_keep = float(atof(val().c_str()));
+        else if (a == "--coast") tc.report_coast = atoi(val().c_str());
+        else if (a == "--dt-ms") dt_ms = atof(val().c_str());
         else if (a == "--nms") lc.nms_iou = float(atof(val().c_str()));
         else if (a == "--state") lc.state = val();
         else if (a == "--threads") lc.threads = atoi(val().c_str());
@@ -176,6 +184,7 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "lights_replay: %s on %s, input %dx%d, roi %.2f,%.2f,%.2f,%.2f, state %s\n", pipe->config().model.c_str(),
             pipe->backend(), lc.in_w, lc.in_h, lc.roi[0], lc.roi[1], lc.roi[2], lc.roi[3], lc.state.c_str());
+    if (lc.det_thr_keep > 0) tc.new_score = lc.det_thr;
     LightTracker tracker(tc);
     std::vector<LightDet> dets;
     std::vector<LightTrackReport> reps;
@@ -184,12 +193,15 @@ int main(int argc, char **argv) {
     Nv12Image frame;
     auto run = [&](const Nv12View &v) {
         LightsTiming t;
-        pipe->process(v, dets, &t);
+        const int view = pipe->has_view2() ? int(seq & 1) : 0;   // wide, zoom, wide, ... like signd
+        pipe->process(v, dets, &t, view);
         ++seq;
-        const int64_t ts = int64_t(seq) * 200000000;  // nominal 5 Hz for the tracker
-        if (track) tracker.update(seq, ts, dets, reps);
+        const int64_t ts = int64_t(double(seq) * dt_ms * 1e6);  // nominal 5 Hz for the tracker unless --dt-ms
+        const float *vr = pipe->view_roi(view);
+        const float seen[4] = {vr[0] * v.width, vr[1] * v.height, vr[2] * v.width, vr[3] * v.height};
+        if (track) tracker.update(seq, ts, dets, reps, seen);
         else reps.clear();
-        printf("%s\n", lights_json(seq, ts, 0, t.total_ms, v.width, v.height, pipe->config(), reps, &dets, &t).c_str());
+        printf("%s\n", lights_json(seq, ts, 0, t.total_ms, v.width, v.height, pipe->config(), reps, &dets, &t, view).c_str());
         t_pre.push_back(t.pre_ms), t_det.push_back(t.det_ms), t_state.push_back(t.state_ms), t_total.push_back(t.total_ms);
     };
     for (const std::string &path : files) {

@@ -115,4 +115,10 @@ if(JPEG_FOUND)
   target_link_libraries(lights_replay PRIVATE ${JPEG_LIBRARIES})
 endif()
 
+# LightTracker checks without a model: build/lights_tracker_test (also `ctest`)
+add_executable(lights_tracker_test tools/lights_tracker_test.cc)
+target_link_libraries(lights_tracker_test PRIVATE signd_core)
+enable_testing()
+add_test(NAME lights_tracker COMMAND lights_tracker_test)
+
 install(TARGETS signd signd_replay lights_replay RUNTIME DESTINATION bin)

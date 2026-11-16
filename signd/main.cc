@@ -173,6 +173,9 @@ void usage() {
             "  --lights          also detect traffic lights (thread of its own, <rundir>/lightd.sock, `lights` topic)\n"
             "  --lights-backend B  ncnn (GPU, default), ncnn-cpu or ort  --lights-model PATH  --lights-in WxH (960x320)\n"
             "  --lights-roi x0,y0,x1,y1  frame fractions fed to the detector (default 0,0,1,0.62)\n"
+            "  --lights-roi2 x0,y0,x1,y1  second view on every other light frame (far lights at a higher scale; default none)\n"
+            "  --lights-thr-keep X  boxes down to this score continue a track, never start one (default: off)\n"
+            "  --lights-coast N  report a confirmed track for N more light frames after its last match (default 0)\n"
             "  --lights-hz X     light frames per second (default 3)  --lights-threads N (2)  --lights-cpus LIST\n"
             "  --lights-thr X (0.25)  --lights-state rule|PATH.onnx (rule)  --lights-timing\n"
             "  --frames N        exit after N processed frames (testing)\n"
@@ -312,7 +315,11 @@ int main(int argc, char **argv) {
             if (sscanf(val().c_str(), "%dx%d", &opt.lc.in_w, &opt.lc.in_h) != 2) return usage(), 2;
         } else if (a == "--lights-roi") {
             if (!parse_floats(val(), opt.lc.roi, 4)) return usage(), 2;
-        } else if (a == "--lights-hz") opt.lights_hz = atof(val().c_str());
+        } else if (a == "--lights-roi2") {
+            if (!parse_floats(val(), opt.lc.roi2, 4)) return usage(), 2;
+        } else if (a == "--lights-thr-keep") opt.lc.det_thr_keep = float(atof(val().c_str()));
+        else if (a == "--lights-coast") opt.ltc.report_coast = atoi(val().c_str());
+        else if (a == "--lights-hz") opt.lights_hz = atof(val().c_str());
         else if (a == "--lights-threads") opt.lc.threads = atoi(val().c_str());
         else if (a == "--lights-cpus") opt.lights_cpus = val();
         else if (a == "--lights-thr") opt.lc.det_thr = float(atof(val().c_str()));
@@ -430,6 +437,12 @@ int main(int argc, char **argv) {
             fprintf(stderr, "signd: lights disabled: %s\n", e.what());
             return;
         }
+        if (opt.lc.det_thr_keep > 0) opt.ltc.new_score = opt.lc.det_thr;
+        if (lp->has_view2())
+            fprintf(stderr, "signd: lights: second view roi %.3f,%.3f,%.3f,%.3f on every other frame\n", opt.lc.roi2[0],
+                    opt.lc.roi2[1], opt.lc.roi2[2], opt.lc.roi2[3]);
+        fprintf(stderr, "signd: lights: thr %.2f keep %.2f, coast %d frames\n", opt.lc.det_thr, opt.lc.det_thr_keep,
+                opt.ltc.report_coast);
         fprintf(stderr, "signd: lights: %s on %s, input %dx%d, roi %.2f,%.2f,%.2f,%.2f, %.1f Hz, state %s, cpus %s%s\n",
                 lp->config().model.c_str(), lp->backend(), opt.lc.in_w, opt.lc.in_h, opt.lc.roi[0], opt.lc.roi[1],
                 opt.lc.roi[2], opt.lc.roi[3], opt.lights_hz, opt.lc.state.c_str(), lcpus.c_str(),
@@ -465,7 +478,7 @@ int main(int argc, char **argv) {
         FrameView lf;
         std::vector<LightDet> ld;
         std::vector<LightTrackReport> lrep;
-        uint64_t l_last = 0, l_n = 0;
+        uint64_t l_last = 0, l_n = 0, l_frames = 0;
         double l_ms = 0, l_det = 0, l_wait = 0;
         auto l_stats_t0 = Clock::now(), l_next = Clock::now();
         const auto period = std::chrono::microseconds(int64_t(1e6 / std::max(0.1, opt.lights_hz)));
@@ -493,8 +506,9 @@ int main(int argc, char **argv) {
             v.y = lf.y, v.uv = lf.uv, v.width = int(lf.width), v.height = int(lf.height);
             v.y_stride = int(lf.y_stride), v.uv_stride = int(lf.uv_stride);
             LightsTiming t;
+            const int view = lp->has_view2() ? int(l_frames++ & 1) : 0;   // wide, zoom, wide, ...
             try {
-                lp->process(v, ld, &t);
+                lp->process(v, ld, &t, view);
             } catch (const std::exception &e) {
                 if (l_turn) gs.end_turn(0), l_turn = false;
                 if (l_mu) l_mu = false, gpu_mu.unlock();
@@ -503,10 +517,12 @@ int main(int argc, char **argv) {
                 continue;
             }
             const auto tt0 = Clock::now();
-            lt.update(lf.seq, lf.ts_mono_ns, ld, lrep);
+            const float *vr = lp->view_roi(view);
+            const float seen[4] = {vr[0] * v.width, vr[1] * v.height, vr[2] * v.width, vr[3] * v.height};
+            lt.update(lf.seq, lf.ts_mono_ns, ld, lrep, seen);
             const double ms = t.total_ms + std::chrono::duration<double, std::milli>(Clock::now() - tt0).count();
             lsrv.publish(lights_json(lf.seq, lf.ts_mono_ns, lf.ts_real_ns, ms, v.width, v.height, lp->config(), lrep,
-                                     opt.lights_timing ? &ld : nullptr, opt.lights_timing ? &t : nullptr));
+                                     opt.lights_timing ? &ld : nullptr, opt.lights_timing ? &t : nullptr, view));
             ++l_n, l_ms += ms, l_det += t.det_ms, l_wait += t.wait_ms;
             const double el = std::chrono::duration<double>(Clock::now() - l_stats_t0).count();
             if (opt.stats_s > 0 && el >= opt.stats_s) {

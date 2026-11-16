@@ -19,6 +19,21 @@ under which terms.
    yellow observation straight after red (Vienna-convention sequence); `flashing` = yellow and off
    alternating within 4 s.
 
+Since 2026-11-16 (roadsense lane L15, measurements in roadsense `docs/lanes/L15-stability.md`), all three
+optional and off by default:
+
+* **Second view** (`--lights-roi2 x0,y0,x1,y1`): every other processed frame feeds this part of the frame to
+  the same detector instead of the wide one. The unit uses the middle 960x320 pixels around the horizon at
+  scale 1.0: far lights are 30 % larger for the detector there than in the wide view (scale 0.72), at the
+  same number of detector runs. The tracker does not count a frame against a track that lies outside the
+  view of that frame. `roi` and `view` in the message say which view a frame used.
+* **Keep threshold** (`--lights-thr-keep 0.12`): boxes scoring between this and `--lights-thr` may continue
+  an existing track (IoU, or a centre distance of 0.75 box sizes) and never start one.
+* **Coasting reports** (`--lights-coast N`): a confirmed track is listed for N more processed frames after
+  its last match, at its predicted box, with its last smoothed state and `coast` = frames since the match
+  (`frame_state` is `unknown`). Without it a light vanished from the message whenever one frame missed it,
+  and with two views it would vanish on every other frame.
+
 ## Detector: dronefreak/bdd100k-yolo11n
 
 | | |

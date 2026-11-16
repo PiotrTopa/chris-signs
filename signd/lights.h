@@ -33,8 +33,16 @@ struct LightsConfig {
     std::string model;             // default: models_dir/bdd100k_yolo11n_<H>x<W>{-ncnn.param,.onnx}
     int in_w = 960, in_h = 320;     // detector input (W x H); the model file is named H x W
     float roi[4] = {0.f, 0.f, 1.f, 0.62f};  // x0, y0, x1, y1 as fractions of the frame
+    // Second view (optional, x1 > x0 enables it): a smaller part of the frame fed to the same detector at a
+    // higher scale, on every other processed frame. The wide view finds the near lights anywhere above the
+    // road, the second one the far lights around the vanishing point that are too small after the wide
+    // view's downscale (roadsense docs/lanes/L15-stability.md).
+    float roi2[4] = {0.f, 0.f, 0.f, 0.f};
     int n_cls = 10, cls_id = 8;    // BDD100K: 8 = traffic light
     float det_thr = 0.25f, nms_iou = 0.45f;
+    // Boxes down to this score are kept for the tracker, which lets them continue an existing track but never
+    // start one (0 = same as det_thr: every box may start a track, the behaviour before 2026-11-16).
+    float det_thr_keep = 0.f;
     int max_det = 30;
     float min_h_px = 6.f;          // drop boxes shorter than this (frame px)
     int threads = 2;               // ORT intra-op / ncnn CPU threads
@@ -65,7 +73,10 @@ public:
     LightPipeline(const LightPipeline &) = delete;
     LightPipeline &operator=(const LightPipeline &) = delete;
 
-    void process(const Nv12View &frame, std::vector<LightDet> &out, LightsTiming *t = nullptr);
+    // view 0 = cfg.roi, view 1 = cfg.roi2 (falls back to roi when no second view is configured).
+    void process(const Nv12View &frame, std::vector<LightDet> &out, LightsTiming *t = nullptr, int view = 0);
+    bool has_view2() const { return cfg_.roi2[2] > cfg_.roi2[0] && cfg_.roi2[3] > cfg_.roi2[1]; }
+    const float *view_roi(int view) const { return view == 1 && has_view2() ? cfg_.roi2 : cfg_.roi; }
     const LightsConfig &config() const { return cfg_; }
     const char *backend() const { return det_->name(); }
     bool has_state_cnn() const { return bool(st_); }
@@ -91,6 +102,15 @@ struct LightTrackerConfig {
     float iou_match = 0.1f;
     float dist_match = 1.5f;  // centre distance / max(w,h) for the fallback pass
     double flash_window_s = 4.0;  // flashing yellow: yellow <-> off alternation inside this window
+    // A box scoring below this continues a track but does not start one (LightsConfig::det_thr_keep lets
+    // such boxes through); 0 = every box may start a track.
+    float new_score = 0.f;
+    float dist_match_weak = 0.75f;  // fallback association distance for those weak boxes
+    // A confirmed track that was not matched in this frame is still reported for this many processed
+    // frames, at its predicted box and with its last state (`coast` = frames since the last match): a
+    // light the detector misses in one frame, or one only the other view can see, does not vanish from the
+    // message. 0 = matched tracks only (the behaviour before 2026-11-16).
+    int report_coast = 0;
 };
 
 struct LightTrackReport {
@@ -100,6 +120,7 @@ struct LightTrackReport {
     int state;        // smoothed
     float state_conf;
     int frame_state;  // this frame's observation (kUnknown if not matched this frame)
+    int coast = 0;    // processed frames since the last match (0 = matched in this frame)
     bool flashing;
     bool horizontal;
     int hits, age;
@@ -109,7 +130,10 @@ struct LightTrackReport {
 class LightTracker {
 public:
     explicit LightTracker(const LightTrackerConfig &cfg) : cfg_(cfg) {}
-    void update(uint64_t seq, int64_t ts_ns, const std::vector<LightDet> &dets, std::vector<LightTrackReport> &out);
+    // `seen` (optional): the part of the frame the detector looked at this time, x0, y0, x1, y1 in frame
+    // pixels; a track whose centre lies outside it could not have been matched and does not age.
+    void update(uint64_t seq, int64_t ts_ns, const std::vector<LightDet> &dets, std::vector<LightTrackReport> &out,
+                const float *seen = nullptr);
     void reset() { tracks_.clear(); }
     size_t live() const { return tracks_.size(); }
 
@@ -123,7 +147,9 @@ private:
         int id;
         float box[4], v[2] = {0, 0};
         float score = 0;
-        int hits = 0, age = 0, since = 0;
+        int hits = 0, age = 0;
+        int since = 0;  // observable frames without a match (ends the track above max_age)
+        int steps = 0;  // processed frames since the last match (the reported `coast`)
         int state = kUnknown, cand = kUnknown, cand_n = 0;
         float state_conf = 0;
         int64_t state_t = 0;
@@ -139,7 +165,7 @@ private:
 
 std::string lights_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, double lights_ms, int frame_w,
                         int frame_h, const LightsConfig &cfg, const std::vector<LightTrackReport> &tracks,
-                        const std::vector<LightDet> *raw = nullptr, const LightsTiming *timing = nullptr);
+                        const std::vector<LightDet> *raw = nullptr, const LightsTiming *timing = nullptr, int view = 0);
 
 }  // namespace signs
 }  // namespace roadsense

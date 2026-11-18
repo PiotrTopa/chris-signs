@@ -12,7 +12,7 @@ regression in measurement quality.
 | 1. sign detector 5 -> 7.5 -> 10 runs/s | reference signs listed 0.74 -> 0.84 (10 Hz, pooled over three rides), first listing 0.2-0.3 s earlier; human labels: within the phase-to-phase noise (false rules 23-25 -> 26, missed 36-40 -> 35) | +51 ms of GPU per extra run: 10 Hz takes about 5 road runs/s away (13.8 -> ~8.5) | **reject now** (needs GPU room, e.g. the v0.11.1 road model) |
 | 2. second full-scale sign view on alternate runs (window x 380-1020, y 192-576) | signs under 24 px: 12-16 px sign-time 0.06 -> 0.23, 16-24 px 0.34 -> 0.45; **but** 24+ px 0.79 -> 0.62 and reference signs listed 0.74 -> 0.71 (warsaw-city, narrow camera: 389 -> 350); human labels: missed 38 -> 39.5, matched 58.5 -> 56.5 | none on the GPU (same run count); CPU about the same | **reject** (regression on large signs); option kept for experiments |
 | 3. the light detector's `traffic sign` class as sign proposals | reference signs listed 0.74 -> 0.81 (`--lights-signs`), first listing +0.4 s; human labels: warnings found 36 -> 39-41, momentary 109 -> 111-113, false rules 23 -> 23-25 (noise ±2), more engine events (momentary 211 -> 219-233) | no detector run; ~1.5 classifier crops per light frame (7-8 crops/s on the big cores) | **A/B on the phone** (`--lights-signs-keep --lights-signs-nohits` = no change at the engine within noise, +5 warnings; `--lights-signs` = most recall, more engine output); not a default |
-| 4. light detector | see section 4 | | see section 4 |
+| 4. light detector (views, thresholds, both views per frame, full Vulkan) | both views on every frame: light-time 97.1 -> 99.0 % (day), 97.6 -> 98.8 % (night); threshold 0.2 and the 1.5x tile: no gain; this lane's reference does not reproduce L15's (no light under 12 px by day), so small-light recall is not measured | both views = 2x the light detector (~+0.9 big core) | **no change**; full Vulkan needs the owner's go (YOLOv8n checkpoint) and GPU room |
 | 5. arrows as a light state | no arrow labels exist (0 of the 320 labelled car crops are marked as arrows; BDD100K has no arrow attribute) | | **needs data** (section 5) |
 
 ## 0. Method
@@ -61,7 +61,8 @@ regression in measurement quality.
   `eval_variant.sh` (human-label scores), `compare_rules.py` (tables), `merge_parts.py` / `merge_ride.sh`.
 * `tools/lights/replay_score.py` (L15) with `lights_replay` for the lights.
 
-Reproduce (laptop; models and scratch paths as in the lane): see the commands under each table. Detections:
+Scratch: `~/datasets/l24s/` (caches, evaluations, light runs); the cache parts were moved to
+`/mnt/win/linux-scratch/l24s/parts` (second disk, not mounted after a reboot). Reproduce (laptop; models and scratch paths as in the lane): see the commands under each table. Detections:
 `~/datasets/l24s/run_cache.sh` (rides in parts of 2000 frames; krakow-2024 every frame with the tiles, the other
 rides every second frame), then `tools/signs_eval/merge_ride.sh <ride>`. Light-thread views were cached on every
 4th frame.
@@ -200,7 +201,54 @@ interleave perfectly with the sign frames, and late light updates (most of them)
 
 ## 4. Light detector
 
-(see below; filled from the light runs)
+Method as L15 / L21: reference = the same detector with four views (the wide band 0,0,1,0.62 at 960x320;
+two full-scale tiles 0,0.125,0.75,0.569 and 0.25,0.125,1,0.569; a 1.5x tile 0.25,0.2083,0.75,0.5042) on every
+second frame of the first 5 min, no tracker, thr 0.2, BDD state model; variants at 5 Hz (every 4th frame,
+`--dt-ms 200`), ORT fp32 on the laptop, scored by `tools/lights/replay_score.py` (sizes = long side of the
+box). Commands: `~/datasets/l24s/lights/ref.sh`, `var2.sh`, then
+`replay_score.py --ref ref_<ride>_{wide,zl,zr,z15}.jsonl:2 --run NAME=v_<ride>_NAME.jsonl:4 ...`.
+
+| variant (5 Hz) | krakow-lights (day): light-time reported | 12-24 px | 24-48 px | 48+ px | drop-outs / min | reported light-frames without a reference box, / min | krakow-night-tunnel: light-time | <12 px | 12-24 px | laptop detector ms per light frame |
+|---|---|---|---|---|---|---|---|---|---|---|
+| today (`--lights-roi2` unit window, keep 0.12, coast 3) | 97.1 % | 27.4 % | 94.5 % | 99.6 % | 0.8 | 34.8 | 97.6 % | 100 % (7) | 96.6 % | 195 |
+| start threshold 0.2 instead of 0.25 | 97.5 % | 34.7 % | 95.8 % | 99.6 % | 0.8 | 45.2 | 98.3 % | 100 % | 97.9 % | 266* |
+| both views on every light frame (10 detector runs/s) | 99.0 % | 68.4 % | 98.6 % | 99.9 % | 0.1 | 54.2 | 98.8 % | 100 % | 97.9 % | 443 |
+| second view = 1.5x tile instead of the unit window | 96.9 % | 27.4 % | 94.4 % | 99.3 % | 1.4 | 27.6 | 91.8 % | 42.9 % | 92.7 % | 201 |
+| no second view (wide band on every frame) | 98.9 % | 68.4 % | 98.3 % | 99.8 % | 0.3 | 44.0 | 96.9 % | 71.4 % | 96.6 % | 246* |
+
+(* laptop timings are under a varying load from other lanes; the detector cost per run is the same model and
+input for all rows except "both views", which is two runs.)
+
+Readings and limits:
+
+* **This reference does not reproduce L15's.** On the same first 5 min of krakow-lights it holds 30 lit lights
+  (426 light-seconds) and no light under 12 px, where L15 / L21 counted 46 lights (844 s) and scored most of
+  their gain under 12 px; the night ride holds 17 lit lights (42 s, 7 light-frames under 12 px). So this run
+  cannot measure what matters most for lights (small far lights), and its two rides disagree on the zoom view:
+  by day "no second view" beats today's alternation (12-24 px 27 -> 68 %), at night it loses (<12 px 100 ->
+  71 %, 7 frames). I do not recommend changing the light views on this evidence; the L15 reference files (on
+  the phone, `~/l21/lightseval.sh`) are the right yardstick and were not reachable.
+* Both views on every frame is the best row on both rides (day 97.1 -> 99.0 %, drop-outs 0.8 -> 0.1/min) but
+  doubles the light detector: +87 ms x 5 = +435 ms of big-core time per second (2 threads), i.e. about +0.9 of
+  a big core on top of today's 0.9 (L21). **Reject** (cost; the big cores are the hot part).
+* Start threshold 0.2: +0.4 / +0.7 points, +30-45 % more reported frames without a reference box. Within
+  what the coasting already does; **no gain worth the extra reports**.
+* 1.5x tile as the second view: worse on both (as in L15). **Reject.**
+* Cheaper at equal quality: an int8 detector through ncnn's quantisation tools (L21's suggestion) needs the
+  ncnn tools built and the accuracy check on BDD100K val; not done here (no ncnn tool build on the laptop; the
+  only ncnn tree on disk belongs to another sub-lane). A smaller input for the wide view would lose exactly the
+  small lights; not worth measuring against this reference.
+* **Full-Vulkan detector.** In the present YOLO11n ncnn graph (`bdd11n_320x960-ncnn.param`: 81 Convolution,
+  66 Swish, 41 Split, 32 BinaryOp, 20 Concat, 12 Sigmoid, 11 Slice, 11 Reshape, 7 ConvolutionDepthWise, 3
+  Pooling, 2 Softmax, 2 Permute, 2 MatMul, 2 Interp) the only layers without a Vulkan kernel are the two
+  `MatMul` of the C2PSA attention block (300 tokens x 2 heads at 960x320; ncnn has `gemm_vulkan` but no
+  `matmul_vulkan`), which is why on the GPU they run on the CPU between submits (L7). They could be rewritten
+  as per-head `Gemm` layers in the param, and the BDD-trained YOLOv8n (`dronefreak/bdd100k-yolov8n`, on disk
+  unloaded) has no attention at all. **Needs the owner's go to load that checkpoint** (refused by the permission
+  system in L7; not retried). What it would buy: the light detector off the big cores (today 0.9 of a big core,
+  ~1.8 W by L21's 2 W per busy big core); what it would cost: the GPU is full in time, and a 960x320 pass is
+  ~1.2x the sign detector's pixels, so ~55-60 ms of GPU per run (estimate, from the sign detector's 51 ms),
+  5 runs/s = ~28 % of the GPU = ~5.5 road runs/s. Only sensible once the road model frees GPU time.
 
 ## 5. Arrows as a light state
 

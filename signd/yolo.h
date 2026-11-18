@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,12 @@ struct PipelineConfig {
     bool appearance = true;
     std::string verifier_model;
     float min_box_px = 4.0f;   // drop degenerate boxes (frame px) before classifying
+    // Second view (optional, x1 > x0 enables it; roadsense lane L24-S): a part of the frame, x0, y0, x1, y1 as
+    // fractions, fed to the same detector at a higher scale (a 640x384-pixel window of a 1280x720 frame = scale
+    // 1.0, the detector's training scale, against 0.5 for the whole frame) on every roi2_every-th processed
+    // frame. Boxes touching an edge of the window that is not a frame edge are dropped (cut signs).
+    float roi2[4] = {0.f, 0.f, 0.f, 0.f};
+    int roi2_every = 2;
     // ORT intra-op busy-wait between ops (session.intra_op.allow_spinning). Off by
     // default: on the SD845 spinning made the detector slower (A55: 422 vs 323 ms,
     // A75: 183 vs 145 ms, 4 threads) and burns cores camerad shares.
@@ -88,6 +95,9 @@ struct Detection {
     std::vector<float> probs;  // full classifier output (empty if not classified)
     float glow = -1.f;      // verify.h glow share; -1 = not checked (top-1 not a round red class)
     float verify = -1.f;    // verifier probability "real sign"; -1 = no verifier / not checked
+    // A box from another detector (signd --lights-signs: the light detector's `traffic sign` class, its score on
+    // another scale): it continues and confirms tracks and votes, but never sets a track's best score / crop.
+    bool external = false;
 };
 
 struct Timing {
@@ -113,8 +123,19 @@ public:
     SignPipeline(const SignPipeline &) = delete;
     SignPipeline &operator=(const SignPipeline &) = delete;
 
-    // Full pipeline on one frame. Detections are sorted by score.
-    void process(const Nv12View &frame, std::vector<Detection> &out, Timing *t = nullptr);
+    // Full pipeline on one frame. Detections are sorted by score. view 0 = the whole frame (letterbox),
+    // view 1 = cfg.roi2 (the whole frame when no second view is configured).
+    void process(const Nv12View &frame, std::vector<Detection> &out, Timing *t = nullptr, int view = 0);
+    bool has_view2() const { return cfg_.roi2[2] > cfg_.roi2[0] && cfg_.roi2[3] > cfg_.roi2[1]; }
+    // View of the n-th processed frame (0-based): view 1 on every roi2_every-th frame, the first one included.
+    int view_for(uint64_t n) const {
+        return has_view2() && cfg_.roi2_every > 0 && n % uint64_t(cfg_.roi2_every) == 0 ? 1 : 0;
+    }
+    // Classifier (+ round-red appearance checks) on boxes found elsewhere, e.g. the light detector's `traffic
+    // sign` boxes (signd --lights-signs, roadsense lane L24-S). Thread-safe against process().
+    void classify(const Nv12View &frame, std::vector<Detection> &dets);
+    // The part of the frame (pixels x0, y0, x1, y1) a view looks at.
+    void view_rect(int view, int frame_w, int frame_h, float out[4]) const;
 
     const ClassNames &names() const { return names_; }
     const PipelineConfig &config() const { return cfg_; }  // with the model paths resolved
@@ -130,12 +151,14 @@ public:
     std::function<void()> before_det, after_det;
 
 private:
+    void classify_locked(const Nv12View &f, std::vector<Detection> &out, double *app_ms);
+    std::mutex cls_mu_;  // classifier buffers: process() and classify() may run on different threads
     std::unique_ptr<ModelRunner> det_, cls_, ver_;
     std::vector<char> red_raw_;  // per raw class: round red (verify.h)
     std::vector<float> app_in_;
     PipelineConfig cfg_;
     ClassNames names_;
-    int lb_w_ = -1, lb_h_ = -1;  // letterbox content size of the last frame
+    int lb_w_ = -1, lb_h_ = -1, lb_l_ = -1, lb_t_ = -1;  // letterbox content size / offset of the last frame
     int in_w_ = 640, in_h_ = 384, n_anchor_ = 0, n_out_ = 0, cls_s_ = 64, n_cls_ = 0;
     std::vector<float> det_in_, det_out_, cls_in_, cls_out_;
 };

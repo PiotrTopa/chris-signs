@@ -39,6 +39,7 @@ struct ExtraFields {
     const Timing *timing = nullptr;
     const std::vector<Detection> *raw = nullptr;  // all detections of this frame, before tracking
     const ClassNames *names = nullptr;
+    int view = -1;  // >= 0: which detector view this frame used (only with a second view, --roi2)
 };
 
 std::string signs_json(const FrameMeta &m, double detect_ms, const std::vector<TrackReport> &dets,

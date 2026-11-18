@@ -39,6 +39,10 @@ struct LightsConfig {
     // view's downscale (roadsense docs/lanes/L15-stability.md).
     float roi2[4] = {0.f, 0.f, 0.f, 0.f};
     int n_cls = 10, cls_id = 8;    // BDD100K: 8 = traffic light
+    // Sign proposals (roadsense lane L24-S, signd --lights-signs): boxes of this class (BDD100K 9 = traffic sign)
+    // scoring > sign_thr are kept too (sign_boxes()), for the sign classifier; -1 = off.
+    int sign_cls = -1;
+    float sign_thr = 0.35f;
     float det_thr = 0.25f, nms_iou = 0.45f;
     // Boxes down to this score are kept for the tracker, which lets them continue an existing track but never
     // start one (0 = same as det_thr: every box may start a track, the behaviour before 2026-11-16).
@@ -80,6 +84,8 @@ public:
     const LightsConfig &config() const { return cfg_; }
     const char *backend() const { return det_->name(); }
     bool has_state_cnn() const { return bool(st_); }
+    // The sign proposals of the last process() call (empty unless cfg.sign_cls >= 0), frame pixels, NMS'd.
+    const std::vector<LightDet> &sign_boxes() const { return signs_; }
     // GPU schedule hooks, as SignPipeline::before_det / after_det.
     std::function<void()> before_det, after_det;
 
@@ -90,6 +96,7 @@ private:
     int n_anchor_ = 0, lb_w_ = -1, lb_h_ = -1;
     std::vector<float> in_, out_, st_in_, st_out_;
     std::vector<float> rgb_;
+    std::vector<LightDet> signs_;
 };
 
 // Colour rule on an RGB crop (planar float 0..1, w x h), vertical housing assumed unless horizontal:

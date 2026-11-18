@@ -220,6 +220,8 @@ void usage() {
             "  --det-thr X (0.35) --cls-gate X (0.6) --nms-iou X (0.45) --cls-margin X (0)\n"
             "  --max-age N (10)  --min-hits N (3)  --iou-match X (0.1)  --crop-margin X (0.15)\n"
             "  --dist-match X (1.0)  --dist-match-new X (1.0, tracks with one hit)\n"
+            "  --roi2 x0,y0,x1,y1  second detector view on every --roi2-every-th processed frame (as signd; default none)\n"
+            "  --roi2-every N (2)\n"
             "  --no-appearance   skip the glow check on round red detections (default on)\n"
             "  --verifier PATH   sign/lamp verifier .onnx (32x32 RGB -> logit) for round red detections (default none)\n"
             "  --glow-px X (0.10) --glow-share X (0.5) --verify-thr X (0.3) --verify-vouch X (0.9)   round red track\n"
@@ -280,6 +282,13 @@ int main(int argc, char **argv) {
         else if (a == "--dist-match") tc.dist_match = float(atof(val().c_str()));
         else if (a == "--dist-match-new") tc.dist_match_new = float(atof(val().c_str()));
         else if (a == "--crop-margin") tc.crop_margin = float(atof(val().c_str()));
+        else if (a == "--roi2") {
+            const std::string v = val();
+            if (sscanf(v.c_str(), "%f,%f,%f,%f", &pc.roi2[0], &pc.roi2[1], &pc.roi2[2], &pc.roi2[3]) != 4) {
+                usage();
+                return 2;
+            }
+        } else if (a == "--roi2-every") pc.roi2_every = std::max(1, atoi(val().c_str()));
         else if (a == "--no-appearance") pc.appearance = false;
         else if (a == "--verifier") pc.verifier_model = val();
         else if (a == "--glow-px") tc.glow_px = float(atof(val().c_str()));
@@ -358,11 +367,13 @@ int main(int argc, char **argv) {
     Nv12Image frame;
     uint64_t seq = 0;
     FrameMeta last;
+    int cur_view = -1;
     auto emit = [&](const FrameMeta &m, double ms, const Timing *t, const std::vector<Detection> *rawd) {
         crop_paths.clear();
         for (const EndedTrack &e : ended) crop_paths.push_back(crops ? crops->save(e.id, e.crop) : std::string());
         ExtraFields ex;
         if (timing) ex.timing = t;
+        ex.view = cur_view;
         if (raw && rawd) {
             ex.raw = rawd;
             ex.names = &pipe->names();
@@ -380,13 +391,17 @@ int main(int argc, char **argv) {
         const Nv12View v = frame.view();
         std::vector<Detection> first_dets;
         for (int r = 0; r < repeat; ++r) {
+            const int view = pipe->view_for(seq);  // as signd: view 1 on every roi2_every-th frame
             ++seq;
             Timing t;
-            pipe->process(v, dets, &t);
+            pipe->process(v, dets, &t, view);
             if (r == 0) first_dets = dets;
             ended.clear();
             const auto tt0 = Clock::now();
-            tracker.update(seq, v, dets, reports, ended);
+            float seen[4];
+            pipe->view_rect(view, v.width, v.height, seen);
+            tracker.update(seq, v, dets, reports, ended, pipe->has_view2() ? seen : nullptr);
+            cur_view = pipe->has_view2() ? view : -1;
             const double ms = t.total_ms + std::chrono::duration<double, std::milli>(Clock::now() - tt0).count();
             t_pre.push_back(t.pre_ms);
             t_det.push_back(t.det_ms);

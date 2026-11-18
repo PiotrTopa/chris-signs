@@ -8,6 +8,7 @@
 #include <cmath>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
 
@@ -338,23 +339,80 @@ SignPipeline::SignPipeline(const PipelineConfig &cfg) : cfg_(cfg) {
 
 SignPipeline::~SignPipeline() = default;
 
-void SignPipeline::process(const Nv12View &f, std::vector<Detection> &out, Timing *tm) {
+void SignPipeline::classify_locked(const Nv12View &f, std::vector<Detection> &out, double *app_ms) {
+    const size_t cplane = size_t(cls_s_) * cls_s_;
+    for (Detection &d : out) {
+        const double bw = d.x1 - d.x0, bh = d.y1 - d.y0, m = cfg_.cls_margin;
+        double x0 = std::max(0.0, d.x0 - m * bw), y0 = std::max(0.0, d.y0 - m * bh);
+        double x1 = std::min(double(f.width), d.x1 + m * bw), y1 = std::min(double(f.height), d.y1 + m * bh);
+        const double w = x1 - x0, h = y1 - y0;
+        // Ultralytics classify transform: short side -> S, centre crop S x S.
+        const double s = cls_s_ / std::min(w, h);
+        const int rw = std::max(cls_s_, int(std::lround(w * s))), rh = std::max(cls_s_, int(std::lround(h * s)));
+        const int l = (rw - cls_s_) / 2, tp = (rh - cls_s_) / 2;
+        const double sxs = w / rw, sys = h / rh;  // source px per resized px
+        nv12_region_to_rgb_planar(f, x0 + l * sxs, y0 + tp * sys, cls_s_ * sxs, cls_s_ * sys, cls_s_, cls_s_,
+                                  cls_in_.data(), cls_s_, cplane, 0, 0);
+        cls_->run(cls_in_.data(), cls_out_.data());
+        const int k = int(std::max_element(cls_out_.begin(), cls_out_.end()) - cls_out_.begin());
+        d.cls_raw = k;
+        d.cls_prob = cls_out_[size_t(k)];
+        d.probs = cls_out_;
+        if ((cfg_.appearance || ver_) && red_raw_[size_t(k)]) {
+            const auto ta = Clock::now();
+            nv12_region_to_rgb_planar(f, d.x0, d.y0, d.x1 - d.x0, d.y1 - d.y0, kAppearanceSize, kAppearanceSize,
+                                      app_in_.data(), kAppearanceSize, size_t(kAppearanceSize) * kAppearanceSize, 0, 0);
+            if (cfg_.appearance) d.glow = glow_score(app_in_.data(), kAppearanceSize);
+            if (ver_) {
+                float logit = 0.f;
+                ver_->run(app_in_.data(), &logit);
+                d.verify = 1.f / (1.f + std::exp(-logit));
+            }
+            *app_ms += ms_since(ta);
+        }
+    }
+}
+
+void SignPipeline::classify(const Nv12View &f, std::vector<Detection> &dets) {
+    std::lock_guard<std::mutex> lk(cls_mu_);
+    double app = 0;
+    classify_locked(f, dets, &app);
+}
+
+void SignPipeline::view_rect(int view, int fw, int fh, float out[4]) const {
+    if (view == 1 && has_view2()) {
+        out[0] = std::floor(cfg_.roi2[0] * fw), out[1] = std::floor(cfg_.roi2[1] * fh);
+        out[2] = std::ceil(cfg_.roi2[2] * fw), out[3] = std::ceil(cfg_.roi2[3] * fh);
+        out[0] = std::max(0.f, out[0]), out[1] = std::max(0.f, out[1]);
+        out[2] = std::min(float(fw), std::max(out[0] + 2, out[2])), out[3] = std::min(float(fh), std::max(out[1] + 2, out[3]));
+    } else {
+        out[0] = out[1] = 0, out[2] = float(fw), out[3] = float(fh);
+    }
+}
+
+void SignPipeline::process(const Nv12View &f, std::vector<Detection> &out, Timing *tm, int view) {
     out.clear();
     Timing t;
     const auto t0 = Clock::now();
 
-    // --- letterbox (geometry exactly as Ultralytics / docs/SIGN_MODELS.md)
-    const double r = std::min(double(in_w_) / f.width, double(in_h_) / f.height);
-    const int nw = int(std::lround(f.width * r)), nh = int(std::lround(f.height * r));
+    // --- letterbox (geometry exactly as Ultralytics / docs/SIGN_MODELS.md); the second view is the same
+    // letterbox of its window instead of the whole frame
+    float vr[4];
+    view_rect(view, f.width, f.height, vr);
+    const double rx0 = vr[0], ry0 = vr[1], rw = vr[2] - vr[0], rh = vr[3] - vr[1];
+    const double r = std::min(double(in_w_) / rw, double(in_h_) / rh);
+    const int nw = int(std::lround(rw * r)), nh = int(std::lround(rh * r));
     const int left = int(std::lround((in_w_ - nw) / 2.0 - 0.1)), top = int(std::lround((in_h_ - nh) / 2.0 - 0.1));
     const size_t plane = size_t(in_w_) * in_h_;
-    // Padding stays at 114/255 (set once); the image area is fully rewritten.
-    if (nw != lb_w_ || nh != lb_h_) {
+    // Padding stays at 114/255 (set once per letterbox geometry); the image area is fully rewritten.
+    if (nw != lb_w_ || nh != lb_h_ || left != lb_l_ || top != lb_t_) {
         std::fill(det_in_.begin(), det_in_.end(), 114.f / 255.f);
         lb_w_ = nw;
         lb_h_ = nh;
+        lb_l_ = left;
+        lb_t_ = top;
     }
-    nv12_region_to_rgb_planar(f, 0, 0, f.width, f.height, nw, nh, det_in_.data(), in_w_, plane, left, top);
+    nv12_region_to_rgb_planar(f, rx0, ry0, rw, rh, nw, nh, det_in_.data(), in_w_, plane, left, top);
     const auto t1 = Clock::now();
     t.pre_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
@@ -400,49 +458,28 @@ void SignPipeline::process(const Nv12View &f, std::vector<Detection> &out, Timin
             if (!dead[j] && iou(cand[i], cand[j]) > cfg_.nms_iou) dead[j] = 1;
         Detection d = cand[i];
         const float W = float(f.width), H = float(f.height);
-        auto mx = [&](float x) { return std::min(std::max(float((x - left) / r), 0.f), W); };
-        auto my = [&](float y) { return std::min(std::max(float((y - top) / r), 0.f), H); };
+        auto mx = [&](float x) { return std::min(std::max(float(rx0 + (x - left) / r), float(vr[0])), std::min(W, vr[2])); };
+        auto my = [&](float y) { return std::min(std::max(float(ry0 + (y - top) / r), float(vr[1])), std::min(H, vr[3])); };
         d.x0 = mx(d.x0);
         d.x1 = mx(d.x1);
         d.y0 = my(d.y0);
         d.y1 = my(d.y1);
         if (d.x1 - d.x0 < cfg_.min_box_px || d.y1 - d.y0 < cfg_.min_box_px) continue;
+        if (view == 1 && has_view2()) {  // cut by an inner edge of the window: the whole-frame view owns it
+            const float m = 2.f;
+            if ((vr[0] > 0 && d.x0 <= vr[0] + m) || (vr[2] < W && d.x1 >= vr[2] - m) || (vr[1] > 0 && d.y0 <= vr[1] + m) ||
+                (vr[3] < H && d.y1 >= vr[3] - m))
+                continue;
+        }
         out.push_back(std::move(d));
     }
     const auto t3 = Clock::now();
     t.post_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
 
     // --- classifier per box
-    const size_t cplane = size_t(cls_s_) * cls_s_;
-    for (Detection &d : out) {
-        const double bw = d.x1 - d.x0, bh = d.y1 - d.y0, m = cfg_.cls_margin;
-        double x0 = std::max(0.0, d.x0 - m * bw), y0 = std::max(0.0, d.y0 - m * bh);
-        double x1 = std::min(double(f.width), d.x1 + m * bw), y1 = std::min(double(f.height), d.y1 + m * bh);
-        const double w = x1 - x0, h = y1 - y0;
-        // Ultralytics classify transform: short side -> S, centre crop S x S.
-        const double s = cls_s_ / std::min(w, h);
-        const int rw = std::max(cls_s_, int(std::lround(w * s))), rh = std::max(cls_s_, int(std::lround(h * s)));
-        const int l = (rw - cls_s_) / 2, tp = (rh - cls_s_) / 2;
-        const double sxs = w / rw, sys = h / rh;  // source px per resized px
-        nv12_region_to_rgb_planar(f, x0 + l * sxs, y0 + tp * sys, cls_s_ * sxs, cls_s_ * sys, cls_s_, cls_s_,
-                                  cls_in_.data(), cls_s_, cplane, 0, 0);
-        cls_->run(cls_in_.data(), cls_out_.data());
-        const int k = int(std::max_element(cls_out_.begin(), cls_out_.end()) - cls_out_.begin());
-        d.cls_raw = k;
-        d.cls_prob = cls_out_[size_t(k)];
-        d.probs = cls_out_;
-        if ((cfg_.appearance || ver_) && red_raw_[size_t(k)]) {
-            const auto ta = Clock::now();
-            nv12_region_to_rgb_planar(f, d.x0, d.y0, d.x1 - d.x0, d.y1 - d.y0, kAppearanceSize, kAppearanceSize,
-                                      app_in_.data(), kAppearanceSize, size_t(kAppearanceSize) * kAppearanceSize, 0, 0);
-            if (cfg_.appearance) d.glow = glow_score(app_in_.data(), kAppearanceSize);
-            if (ver_) {
-                float logit = 0.f;
-                ver_->run(app_in_.data(), &logit);
-                d.verify = 1.f / (1.f + std::exp(-logit));
-            }
-            t.app_ms += ms_since(ta);
-        }
+    {
+        std::lock_guard<std::mutex> lk(cls_mu_);
+        classify_locked(f, out, &t.app_ms);
     }
     t.cls_ms = ms_since(t3);
     t.total_ms = ms_since(t0);

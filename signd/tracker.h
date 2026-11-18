@@ -54,6 +54,12 @@ struct TrackerConfig {
     float verify_thr = 0.3f;
     int verify_min = 2;
     std::vector<std::pair<std::string, float>> class_min_score;
+    // External boxes (Detection::external, signd --lights-signs) may start tracks of their own (true) or only
+    // continue tracks the sign detector started (false, --lights-signs-keep).
+    bool external_starts = true;
+    // External boxes count as hits (confirmation, the reported `hits`) (true), or only keep a track alive and
+    // placed and add their class votes (false): `hits` then keeps its meaning of sign-detector matches.
+    bool external_hits = true;
 };
 
 // "prefix=0.7,prefix2=0.5" -> class_min_score; false on a syntax error.
@@ -90,9 +96,12 @@ class Tracker {
 public:
     Tracker(const TrackerConfig &cfg, const ClassNames &names);
 
-    // One processed frame. `frame` is used for the best crops.
+    // One processed frame. `frame` is used for the best crops. `seen` (optional, frame pixels x0, y0, x1, y1):
+    // the part of the frame the detector looked at this time (second view, roadsense lane L24-S); a track whose
+    // predicted centre lies outside it could not have been matched and is not counted as missed (it still
+    // ends after 3 x max_age frames without a match).
     void update(uint64_t seq, const Nv12View &frame, const std::vector<Detection> &dets,
-                std::vector<TrackReport> &reports, std::vector<EndedTrack> &ended);
+                std::vector<TrackReport> &reports, std::vector<EndedTrack> &ended, const float *seen = nullptr);
     // Ends all live tracks (shutdown / end of a replay sequence).
     void flush(std::vector<EndedTrack> &ended);
 
@@ -112,6 +121,7 @@ private:
         Kalman kf;
         float pred[4];
         int age = 0, hits = 0, since_update = 0;
+        int unseen = 0;  // frames without a match in which the track was outside the view (since_update excludes them)
         bool confirmed = false;
         uint64_t first_seq = 0, last_seq = 0;
         float best_score = 0;

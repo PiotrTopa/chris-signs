@@ -177,7 +177,8 @@ void usage() {
             "  --lights-thr-keep X  boxes down to this score continue a track, never start one (default: off)\n"
             "  --lights-coast N  report a confirmed track for N more light frames after its last match (default 0)\n"
             "  --lights-hz X     light frames per second (default 3)  --lights-threads N (2)  --lights-cpus LIST\n"
-            "  --lights-thr X (0.25)  --lights-state rule|PATH.onnx (rule)  --lights-timing\n"
+            "  --lights-thr X (0.25)  --lights-state rule|PATH.onnx[,PATH2.onnx...] (rule; of a list the first\n"
+            "                    file that exists is used)  --lights-timing\n"
             "  --frames N        exit after N processed frames (testing)\n"
             "  --stats S         stderr stats interval in s (default 10, 0 = off)\n"
             "  --verbose\n"
@@ -355,6 +356,7 @@ int main(int argc, char **argv) {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
+    pthread_setname_np(pthread_self(), "sg-signs");  // thread names: per-stage CPU accounting; pools inherit
 
     std::unique_ptr<SignPipeline> pipe;
     try {
@@ -425,6 +427,7 @@ int main(int argc, char **argv) {
     // ---- traffic lights: own thread, own ring reader, own socket
     if (opt.lc.models_dir.empty() || opt.lc.models_dir == LightsConfig().models_dir) opt.lc.models_dir = opt.pc.models_dir;
     auto lights_main = [&]() {
+        pthread_setname_np(pthread_self(), "sg-lights");
         const std::string lcpus = opt.lights_cpus.empty() ? opt.cpus : opt.lights_cpus;
         if (!lcpus.empty() && lcpus != "none") {
             cpu_set_t set;

@@ -66,3 +66,53 @@ horizontal lights; crops rotated so the red lamp is on the right) are both clear
 CNN (numbers in the lane report); the rule mistakes blue sky behind a back view for a green lamp.
 Red+yellow is not a BDD100K class and the rule cannot tell it from the glare of a red lamp, hence the
 sequence inference in the tracker.
+
+## State CNN for the car's own camera (`lights_state_car_48x24.onnx`, 2026-11-18)
+
+Roadsense lane L21 (`docs/lanes/L21-budget-and-models.md` there). The same network, input and classes; what
+changed is what it is trained on. On the first drives recorded by the car's camera (DVR camera, 1280x720
+MJPEG, low sun) the 2026-10-27 model called 29 % of the lit lights `none`: against a bright sky that camera
+shows a lit lamp as a white disc with a thin coloured rim on a dark housing, and nothing like it is in
+BDD100K. Two steps, both in `tools/lights/`:
+
+1. `train_state2.py`: BDD100K as before, with augmentations for what a dashcam and a detector do to a small
+   lamp: box jitter, reduction to 7 px and back, veiling glare, exposure / gamma / channel gain, blur, JPEG,
+   and **clipped highlights** (every pixel above a brightness threshold pushed towards white).
+2. `finetune_state_car.py`: 12 more epochs on BDD100K with 30 % of every batch taken from labelled detections
+   of the car's own drives.
+
+The labelled sample: `car_scan.py` runs the detector (both views of the unit) and the state CNN on the
+recorder's frames of two drives (2026-11-17, 29 and 70 min; 1,076 detections at score >= 0.25),
+`car_sheets.py` draws a stratified sample of 320 for labelling by eye (half of them called `none` by the old
+model), `car_state_eval.py` / `car_state_cpp.py` score a model in Python and through signd's own pipeline
+(`lights_replay` on the phone). 195 of the 320 are lit lights, 125 are back or side views, dark or
+unreadable housings and things that are no lights.
+
+| model | lit lights of the car sample: right colour / wrong colour / `none` | others called lit | BDD100K test half, recall red / yellow / green / none |
+|---|---|---|---|
+| 2026-10-27 (`lights_state_bdd_48x24`) | 70.2 / 1.0 / 28.8 % (through signd on the phone: 69.7 / 1.0 / 29.3 %) | 14.2 % | 87.1 / 61.0 / 95.8 / 88.2 |
+| augmentations without clipped highlights | 69.4 / 3.1 / 27.5 % | 14.5 % | 82.9 / 75.2 / 95.6 / 86.2 |
+| step 1, with clipped highlights (no car picture in training) | 83.8 / 1.0 / 15.2 % | 15.4 % | 81.0 / 76.0 / 95.2 / 85.2 |
+| step 1 + 2, cross-validated (five folds of one-minute blocks, a light's approach never on both sides) | **90.8 / 0.5 / 8.7 %** | **10.7 %** | 85.0-86.7 / 60.2-63.4 / 95.0-95.3 / 89.6-90.2 |
+| the same fine-tuning without car crops (control) | 73.6 / 1.0 / 25.4 % | 9.8 % | 86.4 / 62.6 / 95.4 / 89.5 |
+| step 2 alone on the 2026-10-27 model, cross-validated | 89.7 / 0.0 / 10.3 % | 11.6 % | 87.9-88.9 / 52.0-54.9 / 94.9-95.1 / 89.0-89.6 |
+| installed file: step 1 + 2 on all 320 labels | in-sample (99.5 %; through signd 100 %): not a measurement | | 86.7 / 64.2 / 94.9 / 89.9 |
+
+What this does and does not show. The clipped-highlight augmentation alone halves the lit lights reported
+dark with no picture of the car in training, but it was designed after looking at the car's crops. The
+cross-validated row is the honest estimate for drives like the two it comes from (one camera, two days,
+sunny, low sun, day and dusk); night, rain and yellow phases (4 in the sample) are not in it. One labeller,
+crops of 10-30 px, so the labels themselves carry errors: a crop was labelled lit only when the lamp was
+visible. Arrows are still not a state. Reproduce:
+
+```sh
+python tools/lights/car_scan.py SCAN.npz ~/roadsense-rec/20261117-101013 ~/roadsense-rec/20261117-145921 ...
+python tools/lights/car_sheets.py SCAN.npz SHEETS --n 320 --skip <parked sessions>    # then SHEETS/labels.txt by eye
+python tools/lights/train_state2.py SAMPLES.json BDD_ROOT aug2w --epochs 60 --whiteout 0.5
+python tools/lights/finetune_state_car.py aug2w.pt SAMPLES.json BDD_ROOT SCAN.npz SHEETS car   # -> car_48x24.onnx
+python tools/lights/car_state_eval.py SCAN.npz SHEETS old.onnx car_48x24.onnx
+```
+
+Licence as for the first model: BDD100K (research / non-commercial) plus the owner's own frames; the weights
+and the labelled sample stay local. `signd --lights-state A.onnx,B.onnx` takes the first file that exists, so
+the unit names the car model first and the BDD model as the one to fall back to.

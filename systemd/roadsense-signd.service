@@ -51,7 +51,15 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/shm/roadsense-frames
 # match (flagged `coast`). krakow-night-tunnel replay at 2.9 Hz: reported share of the light-time 82 -> 94 %, of the
 # lights under 12 px 39 -> 81 %, drop-outs 4.8 -> 1.6 per minute of light-time. The roi2 rows assume the horizon near the
 # middle of the frame (the car's DVR camera, pitch not calibrated): adjust with the camera's pitch.
-ExecStart=/usr/local/bin/signd --det-backend ncnn --cls-backend ort --threads 2 --cpus 4-7 --max-hz 5 --gpu-sync turn --stats 10 --lights --lights-backend ncnn-cpu --lights-threads 2 --lights-cpus 4-7 --lights-hz 3 --lights-roi2 0.125,0.125,0.875,0.569 --lights-thr-keep 0.12 --lights-coast 2 --lights-state /var/lib/roadsense/models/lights_state_bdd_48x24.onnx --verifier /var/lib/roadsense/models/sign_verifier_32.onnx --class-min-score regulatory--no-entry=0.71 --cls /var/lib/roadsense/models/mtsd_signcls_l12_64.onnx --cls-names /var/lib/roadsense/models/mtsd_signcls_l12_classes.txt --dist-match-new 2.0
+# L21 (roadsense docs/lanes/L21-budget-and-models.md, 2026-11-18): lights at 5 Hz instead of 3 (each of the two views
+# 2.5 times a second; --lights-coast 3 keeps the 0.6 s a missed light stays listed). On the replays the reported share of
+# the light-time went from 95.5 to 98.3 % by day and 93.6 to 98.9 % at night, lights under 12 px 81 -> 93-96 %, drop-outs
+# 1.7-2.4 -> 0-0.2 per minute of light-time. It costs 36 % of a big core, paid for by envd's move to the little cores
+# (roadsense unit). State model: the first file of the list that is installed; lights_state_car_48x24.onnx is the BDD
+# model retrained with clipped-highlight augmentation and fine-tuned on labelled detections from the car's own camera
+# (docs/LIGHT_MODELS.md): lit lights of the car's drives given their colour 70 -> 91 % (cross-validated), reported
+# dark 29 -> 9 %.
+ExecStart=/usr/local/bin/signd --det-backend ncnn --cls-backend ort --threads 2 --cpus 4-7 --max-hz 5 --gpu-sync turn --stats 10 --lights --lights-backend ncnn-cpu --lights-threads 2 --lights-cpus 4-7 --lights-hz 5 --lights-roi2 0.125,0.125,0.875,0.569 --lights-thr-keep 0.12 --lights-coast 3 --lights-state /var/lib/roadsense/models/lights_state_car_48x24.onnx,/var/lib/roadsense/models/lights_state_bdd_48x24.onnx --verifier /var/lib/roadsense/models/sign_verifier_32.onnx --class-min-score regulatory--no-entry=0.71 --cls /var/lib/roadsense/models/mtsd_signcls_l12_64.onnx --cls-names /var/lib/roadsense/models/mtsd_signcls_l12_classes.txt --dist-match-new 2.0
 Restart=always
 RestartSec=2
 Nice=-5

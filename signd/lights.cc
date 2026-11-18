@@ -101,6 +101,23 @@ LightPipeline::LightPipeline(const LightsConfig &cfg) : cfg_(cfg) {
     det_ = make_runner(ro);
     in_.assign(size_t(3) * cfg_.in_w * cfg_.in_h, 114.f / 255.f);
     out_.assign(ro.output_size, 0.f);
+    if (cfg_.state.find(',') != std::string::npos) {
+        // A list of state models, best first: the first readable file is used (a newer model that a host
+        // may not have installed yet, then the one before it).
+        std::string pick;
+        size_t a = 0;
+        while (a <= cfg_.state.size()) {
+            const size_t b = std::min(cfg_.state.find(',', a), cfg_.state.size());
+            const std::string f = cfg_.state.substr(a, b - a);
+            if (!f.empty() && (f == "rule" || access(f.c_str(), R_OK) == 0)) {
+                pick = f;
+                break;
+            }
+            if (!f.empty()) pick = f;  // none readable: report the last one below
+            a = b + 1;
+        }
+        cfg_.state = pick;
+    }
     if (cfg_.state != "rule" && access(cfg_.state.c_str(), R_OK) != 0) {
         // The state CNN is trained on research-licensed data and installed by hand (docs/LIGHT_MODELS.md):
         // without it the lamp colour rule decides.

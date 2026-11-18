@@ -115,10 +115,17 @@ if(JPEG_FOUND)
   target_link_libraries(lights_replay PRIVATE ${JPEG_LIBRARIES})
 endif()
 
+# Sign tracker on precomputed detections (roadsense lane L24-S evaluation: rates, view schedules)
+add_executable(signs_track_replay tools/signs_track_replay.cc)
+target_link_libraries(signs_track_replay PRIVATE signd_core)
+
 # LightTracker checks without a model: build/lights_tracker_test (also `ctest`)
 add_executable(lights_tracker_test tools/lights_tracker_test.cc)
 target_link_libraries(lights_tracker_test PRIVATE signd_core)
 enable_testing()
 add_test(NAME lights_tracker COMMAND lights_tracker_test)
+add_executable(signs_tracker_test tools/signs_tracker_test.cc)
+target_link_libraries(signs_tracker_test PRIVATE signd_core)
+add_test(NAME signs_tracker COMMAND signs_tracker_test)
 
 install(TARGETS signd signd_replay lights_replay RUNTIME DESTINATION bin)

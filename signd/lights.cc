@@ -247,6 +247,31 @@ void LightPipeline::process(const Nv12View &f, std::vector<LightDet> &out, Light
             if (!dead[j] && iou4(&cand[i].x0, &cand[j].x0) > cfg_.nms_iou) dead[j] = 1;
         out.push_back(cand[i]);
     }
+    signs_.clear();
+    if (cfg_.sign_cls >= 0 && cfg_.sign_cls < cfg_.n_cls) {  // sign proposals: same decode, own class row
+        const float *ss = o + size_t(4 + cfg_.sign_cls) * N;
+        std::vector<LightDet> sc;
+        for (size_t i = 0; i < N; ++i) {
+            if (!(ss[i] > cfg_.sign_thr)) continue;
+            const float cx = o[i], cy = o[N + i], w = o[2 * N + i], h = o[3 * N + i];
+            LightDet d;
+            d.x0 = std::max(float(rx0 + (cx - w / 2) / r), 0.f);
+            d.y0 = std::max(float(ry0 + (cy - h / 2) / r), 0.f);
+            d.x1 = std::min(float(rx0 + (cx + w / 2) / r), float(f.width));
+            d.y1 = std::min(float(ry0 + (cy + h / 2) / r), float(f.height));
+            d.score = ss[i];
+            if (d.x1 - d.x0 < 4 || d.y1 - d.y0 < 4) continue;
+            sc.push_back(d);
+        }
+        std::stable_sort(sc.begin(), sc.end(), [](const LightDet &a, const LightDet &b) { return a.score > b.score; });
+        std::vector<char> sd(sc.size(), 0);
+        for (size_t i = 0; i < sc.size() && signs_.size() < 30; ++i) {
+            if (sd[i]) continue;
+            for (size_t j = i + 1; j < sc.size(); ++j)
+                if (!sd[j] && iou4(&sc[i].x0, &sc[j].x0) > cfg_.nms_iou) sd[j] = 1;
+            signs_.push_back(sc[i]);
+        }
+    }
     const auto t3 = Clock::now();
     t.post_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
     for (LightDet &d : out) classify(f, d);

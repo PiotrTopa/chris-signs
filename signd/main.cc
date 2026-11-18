@@ -65,6 +65,15 @@ struct Options {
     double lights_hz = 3;
     std::string lights_cpus;        // empty: same as --cpus
     bool lights_timing = false;
+    bool lights_signs = false;      // --lights-signs: the light detector's `traffic sign` boxes go to the sign tracker
+};
+
+// One light frame's sign proposals, classified, waiting for the sign thread (--lights-signs).
+struct SignProposals {
+    uint64_t seq;
+    int64_t ts_mono_ns, ts_real_ns;
+    std::vector<roadsense::signs::Detection> dets;
+    float seen[4];
 };
 
 std::string config_dir() {
@@ -157,6 +166,9 @@ void usage() {
             "  --dist-match X    tracker: max centre distance / box size, fallback pass (default 1.0)\n"
             "  --dist-match-new X  the same for tracks with one hit (default 1.0)\n"
             "  --crop-margin X   relative margin of the saved best crop (default 0.15)\n"
+            "  --roi2 x0,y0,x1,y1  second detector view (frame fractions) on every --roi2-every-th frame, at the scale\n"
+            "                    that fits it into the detector input (default none; e.g. 0.5,0.2,1,0.733 = the right\n"
+            "                    640x384 px of a 1280x720 frame at scale 1.0)   --roi2-every N (2)\n"
             "  --no-appearance   skip the glow check on round red detections (default on)\n"
             "  --verifier PATH   sign/lamp verifier .onnx (32x32 RGB -> logit) for round red detections (default none)\n"
             "  --glow-px X (0.10) --glow-share X (0.5) --verify-thr X (0.3) --verify-vouch X (0.9)   round red track\n"
@@ -177,6 +189,9 @@ void usage() {
             "  --lights-thr-keep X  boxes down to this score continue a track, never start one (default: off)\n"
             "  --lights-coast N  report a confirmed track for N more light frames after its last match (default 0)\n"
             "  --lights-hz X     light frames per second (default 3)  --lights-threads N (2)  --lights-cpus LIST\n"
+            "  --lights-signs    the light detector's `traffic sign` boxes (BDD100K class 9, score > --lights-signs-thr,\n"
+            "                    default 0.35) are classified by the sign classifier and fed to the sign tracker as\n"
+            "                    updates of their own (one `signs` message each); default off\n"
             "  --lights-thr X (0.25)  --lights-state rule|PATH.onnx[,PATH2.onnx...] (rule; of a list the first\n"
             "                    file that exists is used)  --lights-timing\n"
             "  --frames N        exit after N processed frames (testing)\n"
@@ -290,6 +305,9 @@ int main(int argc, char **argv) {
         else if (a == "--dist-match") opt.tc.dist_match = float(atof(val().c_str()));
         else if (a == "--dist-match-new") opt.tc.dist_match_new = float(atof(val().c_str()));
         else if (a == "--crop-margin") opt.tc.crop_margin = float(atof(val().c_str()));
+        else if (a == "--roi2") {
+            if (!parse_floats(val(), opt.pc.roi2, 4)) return usage(), 2;
+        } else if (a == "--roi2-every") opt.pc.roi2_every = std::max(1, atoi(val().c_str()));
         else if (a == "--no-appearance") opt.pc.appearance = false;
         else if (a == "--verifier") opt.pc.verifier_model = val();
         else if (a == "--glow-px") opt.tc.glow_px = float(atof(val().c_str()));
@@ -326,6 +344,8 @@ int main(int argc, char **argv) {
         else if (a == "--lights-thr") opt.lc.det_thr = float(atof(val().c_str()));
         else if (a == "--lights-state") opt.lc.state = val();
         else if (a == "--lights-timing") opt.lights_timing = true;
+        else if (a == "--lights-signs") opt.lights_signs = true, opt.lc.sign_cls = 9;
+        else if (a == "--lights-signs-thr") opt.lc.sign_thr = float(atof(val().c_str()));
         else if (a == "--frames") opt.max_frames = strtoull(val().c_str(), nullptr, 10);
         else if (a == "--stats") opt.stats_s = atof(val().c_str());
         else if (a == "--verbose" || a == "-v") opt.verbose = true;
@@ -370,6 +390,9 @@ int main(int argc, char **argv) {
             opt.pc.appearance ? "on" : "off", opt.tc.glow_px, opt.tc.glow_share, opt.tc.glow_alone ? ", alone" : "",
             pipe->has_verifier() ? opt.pc.verifier_model.c_str() : "none", opt.tc.verify_thr, opt.tc.verify_vouch,
             opt.tc.class_min_score.size());
+    if (pipe->has_view2())
+        fprintf(stderr, "signd: second view roi %.3f,%.3f,%.3f,%.3f on every %d. frame\n", opt.pc.roi2[0], opt.pc.roi2[1],
+                opt.pc.roi2[2], opt.pc.roi2[3], opt.pc.roi2_every);
     fprintf(stderr,
             "signd: detector %dx%d on %s (%s), classifier on %s (%s), %zu classes (%zu merged), %d threads on cpus %s, "
             "det_thr %.2f cls_gate %.2f nms %.2f\n",
@@ -423,6 +446,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "signd: GPU sync %s via %s (timeout %d ms)\n", opt.gpu_sync.c_str(), gp.c_str(),
                 opt.gpu_sync_timeout_ms);
     }
+
+    std::mutex prop_mu;  // --lights-signs: light thread -> sign thread
+    std::vector<SignProposals> proposals;
 
     // ---- traffic lights: own thread, own ring reader, own socket
     if (opt.lc.models_dir.empty() || opt.lc.models_dir == LightsConfig().models_dir) opt.lc.models_dir = opt.pc.models_dir;
@@ -526,6 +552,20 @@ int main(int argc, char **argv) {
             const double ms = t.total_ms + std::chrono::duration<double, std::milli>(Clock::now() - tt0).count();
             lsrv.publish(lights_json(lf.seq, lf.ts_mono_ns, lf.ts_real_ns, ms, v.width, v.height, lp->config(), lrep,
                                      opt.lights_timing ? &ld : nullptr, opt.lights_timing ? &t : nullptr, view));
+            if (opt.lights_signs) {  // sign proposals of this light frame -> sign classifier -> sign thread
+                SignProposals sp;
+                sp.seq = lf.seq, sp.ts_mono_ns = lf.ts_mono_ns, sp.ts_real_ns = lf.ts_real_ns;
+                std::copy(seen, seen + 4, sp.seen);
+                for (const LightDet &b : lp->sign_boxes()) {
+                    Detection d;
+                    d.x0 = b.x0, d.y0 = b.y0, d.x1 = b.x1, d.y1 = b.y1, d.score = b.score;
+                    d.external = true;
+                    sp.dets.push_back(std::move(d));
+                }
+                if (!sp.dets.empty()) pipe->classify(v, sp.dets);
+                std::lock_guard<std::mutex> lk(prop_mu);
+                if (proposals.size() < 8) proposals.push_back(std::move(sp));
+            }
             ++l_n, l_ms += ms, l_det += t.det_ms, l_wait += t.wait_ms;
             const double el = std::chrono::duration<double>(Clock::now() - l_stats_t0).count();
             if (opt.stats_s > 0 && el >= opt.stats_s) {
@@ -555,12 +595,14 @@ int main(int argc, char **argv) {
     double stats_ms = 0, stats_det = 0;
     FrameMeta last_meta;
     auto next_allowed = Clock::now();
+    int last_view = -1;
 
     auto publish = [&](const FrameMeta &m, double ms, const Timing *t) {
         crop_paths.clear();
         for (const EndedTrack &e : ended) crop_paths.push_back(crops.save(e.id, e.crop));
         ExtraFields ex;
         if (opt.timing) ex.timing = t;
+        ex.view = last_view;
         srv.publish(signs_json(m, ms, reports, ended, crop_paths, ex));
     };
 
@@ -586,6 +628,10 @@ int main(int argc, char **argv) {
         }
         if (opt.max_hz > 0) next_allowed = Clock::now() + std::chrono::microseconds(int64_t(1e6 / opt.max_hz));
         if (fv.seq < last_seq) {  // camerad restarted: the old tracks cannot continue
+            if (opt.lights_signs) {
+                std::lock_guard<std::mutex> lk(prop_mu);
+                proposals.clear();
+            }
             reports.clear();
             ended.clear();
             tracker.flush(ended);
@@ -594,6 +640,26 @@ int main(int argc, char **argv) {
             skipped += fv.seq - last_seq - 1;
         }
         last_seq = fv.seq;
+        if (opt.lights_signs) {  // light frames older than this frame: tracker updates of their own, in order
+            std::vector<SignProposals> todo;
+            {
+                std::lock_guard<std::mutex> lk(prop_mu);
+                for (auto it = proposals.begin(); it != proposals.end();)
+                    if (it->seq < fv.seq) todo.push_back(std::move(*it)), it = proposals.erase(it);
+                    else ++it;
+            }
+            for (SignProposals &sp : todo) {
+                Nv12View cv;  // external boxes never crop: the tracker does not read the frame for them
+                cv.y = fv.y, cv.uv = fv.uv, cv.width = int(fv.width), cv.height = int(fv.height);
+                cv.y_stride = int(fv.y_stride), cv.uv_stride = int(fv.uv_stride);
+                ended.clear();
+                tracker.update(sp.seq, cv, sp.dets, reports, ended, sp.seen);
+                FrameMeta pm;
+                pm.seq = sp.seq, pm.ts_mono_ns = sp.ts_mono_ns, pm.ts_real_ns = sp.ts_real_ns;
+                last_view = 2;  // a light frame
+                publish(pm, 0.0, nullptr);
+            }
+        }
         if (fv.format != kFormatNV12 || (fv.width & 1) || (fv.height & 1)) {
             fprintf(stderr, "signd: unsupported frame %ux%u format %u\n", fv.width, fv.height, fv.format);
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -607,8 +673,9 @@ int main(int argc, char **argv) {
         v.y_stride = int(fv.y_stride);
         v.uv_stride = int(fv.uv_stride);
         Timing t;
+        const int view = pipe->view_for(processed);  // --roi2: second view on every roi2_every-th frame
         try {
-            pipe->process(v, dets, &t);
+            pipe->process(v, dets, &t, view);
         } catch (const std::exception &e) {
             if (turn_held) gs.end_turn(), turn_held = false;
             if (mu_held) mu_held = false, gpu_mu.unlock();
@@ -618,7 +685,10 @@ int main(int argc, char **argv) {
         }
         ended.clear();
         const auto tt0 = Clock::now();
-        tracker.update(fv.seq, v, dets, reports, ended);
+        float seen[4];
+        pipe->view_rect(view, v.width, v.height, seen);
+        tracker.update(fv.seq, v, dets, reports, ended, pipe->has_view2() ? seen : nullptr);
+        last_view = pipe->has_view2() ? view : -1;
         const double detect_ms = t.total_ms + std::chrono::duration<double, std::milli>(Clock::now() - tt0).count();
         FrameMeta m;
         m.seq = fv.seq;

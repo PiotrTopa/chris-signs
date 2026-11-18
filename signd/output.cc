@@ -163,6 +163,7 @@ std::string signs_json(const FrameMeta &m, double detect_ms, const std::vector<T
         num(o, t.cls_ms, 1);
         o.push_back('}');
     }
+    if (extra.view >= 0) o += ",\"view\":" + std::to_string(extra.view);
     if (extra.raw && extra.names) {
         o += ",\"raw\":[";
         for (size_t i = 0; i < extra.raw->size(); ++i) {

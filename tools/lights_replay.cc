@@ -99,6 +99,7 @@ void usage() {
             "  --state rule|PATH.onnx (rule)   --threads N (2)   --cpus LIST (none)   --ncnn-fp32  --ncnn-no-flushall\n"
             "  --roi2 x0,y0,x1,y1  second view on every other processed frame (none)   --thr-keep X (off)   --coast N (0)\n"
             "  --dt-ms X  time between processed frames for the tracker (200)\n"
+            "  --both     with --roi2: run both views on every frame (detections merged by NMS) instead of alternating\n"
             "  --size WxH (raw NV12)  --every N (1)  --max-frames N  --repeat N  --no-track  --bench N (time N more passes)\n");
 }
 
@@ -122,7 +123,7 @@ int main(int argc, char **argv) {
     std::string cpus = "none";
     int raw_w = 0, raw_h = 0, every = 1, repeat = 1, bench = 0;
     uint64_t max_frames = 0;
-    bool track = true;
+    bool track = true, both = false;
     double dt_ms = 200;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -155,6 +156,7 @@ int main(int argc, char **argv) {
         else if (a == "--max-frames") max_frames = strtoull(val().c_str(), nullptr, 10);
         else if (a == "--repeat") repeat = std::max(1, atoi(val().c_str()));
         else if (a == "--no-track") track = false;
+        else if (a == "--both") both = true;
         else if (a == "--bench") bench = atoi(val().c_str());
         else if (a == "--help" || a == "-h") return usage(), 0;
         else if (!a.empty() && a[0] == '-') return usage(), 2;
@@ -193,8 +195,28 @@ int main(int argc, char **argv) {
     Nv12Image frame;
     auto run = [&](const Nv12View &v) {
         LightsTiming t;
-        const int view = pipe->has_view2() ? int(seq & 1) : 0;   // wide, zoom, wide, ... like signd
+        const int view = pipe->has_view2() && !both ? int(seq & 1) : 0;   // wide, zoom, wide, ... like signd
         pipe->process(v, dets, &t, view);
+        if (both && pipe->has_view2()) {  // second view on the same frame, merged by score-ordered NMS
+            std::vector<LightDet> d2;
+            LightsTiming t2;
+            pipe->process(v, d2, &t2, 1);
+            t.det_ms += t2.det_ms, t.total_ms += t2.total_ms;
+            dets.insert(dets.end(), d2.begin(), d2.end());
+            std::stable_sort(dets.begin(), dets.end(), [](const LightDet &x, const LightDet &y) { return x.score > y.score; });
+            std::vector<LightDet> kept;
+            for (const LightDet &d : dets) {
+                bool ok = true;
+                for (const LightDet &k : kept) {
+                    const float ix = std::max(0.f, std::min(d.x1, k.x1) - std::max(d.x0, k.x0));
+                    const float iy = std::max(0.f, std::min(d.y1, k.y1) - std::max(d.y0, k.y0));
+                    const float in = ix * iy;
+                    if (in / ((d.x1 - d.x0) * (d.y1 - d.y0) + (k.x1 - k.x0) * (k.y1 - k.y0) - in + 1e-9f) > 0.45f) ok = false;
+                }
+                if (ok) kept.push_back(d);
+            }
+            dets.swap(kept);
+        }
         ++seq;
         const int64_t ts = int64_t(double(seq) * dt_ms * 1e6);  // nominal 5 Hz for the tracker unless --dt-ms
         const float *vr = pipe->view_roi(view);

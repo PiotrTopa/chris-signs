@@ -214,13 +214,15 @@ void Tracker::end(Track &t, std::vector<EndedTrack> &ended) {
 }
 
 void Tracker::update(uint64_t seq, const Nv12View &frame, const std::vector<Detection> &dets,
-                     std::vector<TrackReport> &reports, std::vector<EndedTrack> &ended) {
+                     std::vector<TrackReport> &reports, std::vector<EndedTrack> &ended, const float *seen) {
     reports.clear();
     for (Track &t : tracks_) {
         t.kf.predict();
         t.kf.box(t.pred);
         ++t.age;
-        ++t.since_update;
+        const float cx = (t.pred[0] + t.pred[2]) / 2, cy = (t.pred[1] + t.pred[3]) / 2;
+        if (!seen || (cx >= seen[0] && cx <= seen[2] && cy >= seen[1] && cy <= seen[3])) ++t.since_update;
+        else ++t.unseen;
     }
     const size_t nt = tracks_.size(), nd = dets.size();
     std::vector<int> det_track(nd, -1);
@@ -271,6 +273,7 @@ void Tracker::update(uint64_t seq, const Nv12View &frame, const std::vector<Dete
         const float b[4] = {d.x0, d.y0, d.x1, d.y1};
         ++t.hits;
         t.since_update = 0;
+        t.unseen = 0;
         t.last_seq = seq;
         if (t.hits >= cfg_.min_hits) t.confirmed = true;
         if (d.cls_raw >= 0 && d.cls_prob >= cfg_.cls_gate && d.probs.size() == names_.raw.size()) {
@@ -285,7 +288,7 @@ void Tracker::update(uint64_t seq, const Nv12View &frame, const std::vector<Dete
             ++t.n_verified;
             t.verify_sum += d.verify;
         }
-        if (d.score > t.best_score) {
+        if (!d.external && d.score > t.best_score) {
             t.best_score = d.score;
             const float mw = cfg_.crop_margin * (b[2] - b[0]), mh = cfg_.crop_margin * (b[3] - b[1]);
             nv12_crop(frame, int(std::floor(b[0] - mw)), int(std::floor(b[1] - mh)), int(std::ceil(b[2] + mw)),
@@ -332,7 +335,7 @@ void Tracker::update(uint64_t seq, const Nv12View &frame, const std::vector<Dete
     }
     // Reap.
     for (size_t i = 0; i < tracks_.size();) {
-        if (tracks_[i].since_update > cfg_.max_age) {
+        if (tracks_[i].since_update > cfg_.max_age || tracks_[i].since_update + tracks_[i].unseen > 3 * cfg_.max_age) {
             end(tracks_[i], ended);
             tracks_.erase(tracks_.begin() + long(i));
         } else {

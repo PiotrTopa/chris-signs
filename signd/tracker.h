@@ -54,6 +54,12 @@ struct TrackerConfig {
     float verify_thr = 0.3f;
     int verify_min = 2;
     std::vector<std::pair<std::string, float>> class_min_score;
+    // External boxes (Detection::external, signd --lights-signs) may start tracks of their own (true) or only
+    // continue tracks the sign detector started (false, --lights-signs-keep).
+    bool external_starts = true;
+    // External boxes count as hits (confirmation, the reported `hits`) (true), or only keep a track alive and
+    // placed and add their class votes (false): `hits` then keeps its meaning of sign-detector matches.
+    bool external_hits = true;
 };
 
 // "prefix=0.7,prefix2=0.5" -> class_min_score; false on a syntax error.

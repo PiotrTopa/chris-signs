@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <sstream>
 #include <string>
@@ -77,7 +78,11 @@ void usage() {
             "usage: signs_track_replay --dets NAME=FILE [--dets ...] [--rect NAME=x0,y0,x1,y1] --schedule FILE --cls-names PATH\n"
             "  [--det-thr X (0.35)] [--cls-gate X] [--max-age N] [--min-hits N] [--iou-match X] [--dist-match X]\n"
             "  [--dist-match-new X] [--glow-px X] [--glow-share X] [--glow-alone] [--verify-thr X] [--verify-vouch X]\n"
-            "  [--class-min-score LIST] [--frame-w W (1280)] [--frame-h H (720)]\n");
+            "  [--class-min-score LIST] [--frame-w W (1280)] [--frame-h H (720)]\n"
+            "  [--external-keep]  light-source boxes only continue tracks (signd --lights-signs-keep)\n"
+            "  [--external-nohits]  light-source boxes are no hits (signd --lights-signs-nohits)\n"
+            "  [--quiet-light]  updates from light sources (names starting with L) publish no message: their ended\n"
+            "                   tracks go out with the next one (signd --lights-signs when a light frame arrives late)\n");
 }
 
 }  // namespace
@@ -89,6 +94,7 @@ int main(int argc, char **argv) {
     std::map<std::string, std::string> dets_files;
     std::map<std::string, std::vector<float>> rects;
     int fw = 1280, fh = 720;
+    bool quiet_light = false;  // light-source updates publish no message (signd when they arrive late)
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto val = [&]() -> std::string {
@@ -123,7 +129,10 @@ int main(int argc, char **argv) {
         else if (a == "--verify-vouch") tc.verify_vouch = float(atof(val().c_str()));
         else if (a == "--class-min-score") {
             if (!parse_class_min_score(val(), &tc.class_min_score)) return usage(), 2;
-        } else if (a == "--frame-w") fw = atoi(val().c_str());
+        } else if (a == "--quiet-light") quiet_light = true;
+        else if (a == "--external-keep") tc.external_starts = false;
+        else if (a == "--external-nohits") tc.external_hits = false;
+        else if (a == "--frame-w") fw = atoi(val().c_str());
         else if (a == "--frame-h") fh = atoi(val().c_str());
         else return usage(), a == "--help" ? 0 : 2;
     }
@@ -148,6 +157,7 @@ int main(int argc, char **argv) {
     std::vector<TrackReport> reports;
     std::vector<EndedTrack> ended;
     std::vector<std::string> crops;
+    std::vector<EndedTrack> carry;
     std::ifstream sf(schedule);
     std::string line;
     uint64_t seq = 0;
@@ -202,6 +212,12 @@ int main(int argc, char **argv) {
         ++seq;
         ended.clear();
         tracker.update(seq, dv, dets, reports, ended, windows && !full ? seen : nullptr);
+        if (quiet_light && spec[0] == 'L') {  // tracker update only; ended tracks go out with the next message
+            for (EndedTrack &e : ended) carry.push_back(std::move(e));
+            continue;
+        }
+        if (!carry.empty()) ended.insert(ended.begin(), std::make_move_iterator(carry.begin()),
+                                         std::make_move_iterator(carry.end())), carry.clear();
         FrameMeta m;
         m.seq = seq;
         last = m;
@@ -211,6 +227,7 @@ int main(int argc, char **argv) {
     reports.clear();
     ended.clear();
     tracker.flush(ended);
+    ended.insert(ended.begin(), std::make_move_iterator(carry.begin()), std::make_move_iterator(carry.end()));
     if (!ended.empty()) emit(last, last_frame);
     return 0;
 }

@@ -271,7 +271,7 @@ void Tracker::update(uint64_t seq, const Nv12View &frame, const std::vector<Dete
     const size_t n_merged = names_.merged.size();
     auto absorb = [&](Track &t, const Detection &d) {
         const float b[4] = {d.x0, d.y0, d.x1, d.y1};
-        ++t.hits;
+        if (!d.external || cfg_.external_hits) ++t.hits;
         t.since_update = 0;
         t.unseen = 0;
         t.last_seq = seq;
@@ -302,7 +302,7 @@ void Tracker::update(uint64_t seq, const Nv12View &frame, const std::vector<Dete
             Track &t = tracks_[size_t(det_track[j])];
             t.kf.update(b);
             absorb(t, d);
-        } else {
+        } else if (!d.external || cfg_.external_starts) {
             Track t;
             t.id = next_id_++;
             t.kf.init(b);
@@ -315,6 +315,7 @@ void Tracker::update(uint64_t seq, const Nv12View &frame, const std::vector<Dete
     }
     // Reports: confirmed tracks matched in this frame, in detection order.
     for (size_t j = 0; j < nd; ++j) {
+        if (det_track[j] < 0) continue;  // an external box that may not start a track
         const Track &t = tracks_[size_t(det_track[j])];
         if (!t.confirmed) continue;
         TrackReport r;

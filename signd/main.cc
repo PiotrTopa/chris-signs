@@ -191,7 +191,10 @@ void usage() {
             "  --lights-hz X     light frames per second (default 3)  --lights-threads N (2)  --lights-cpus LIST\n"
             "  --lights-signs    the light detector's `traffic sign` boxes (BDD100K class 9, score > --lights-signs-thr,\n"
             "                    default 0.35) are classified by the sign classifier and fed to the sign tracker as\n"
-            "                    updates of their own (one `signs` message each); default off\n"
+            "                    updates of their own (a `signs` message each, view 2, when not older than the last\n"
+            "                    message); default off. --lights-signs-keep: the same, but those boxes only continue\n"
+            "                    tracks the sign detector started; --lights-signs-nohits: those boxes are not counted\n"
+            "                    as hits (they keep a track alive and placed and vote)\n"
             "  --lights-thr X (0.25)  --lights-state rule|PATH.onnx[,PATH2.onnx...] (rule; of a list the first\n"
             "                    file that exists is used)  --lights-timing\n"
             "  --frames N        exit after N processed frames (testing)\n"
@@ -346,6 +349,8 @@ int main(int argc, char **argv) {
         else if (a == "--lights-timing") opt.lights_timing = true;
         else if (a == "--lights-signs") opt.lights_signs = true, opt.lc.sign_cls = 9;
         else if (a == "--lights-signs-thr") opt.lc.sign_thr = float(atof(val().c_str()));
+        else if (a == "--lights-signs-keep") opt.lights_signs = true, opt.lc.sign_cls = 9, opt.tc.external_starts = false;
+        else if (a == "--lights-signs-nohits") opt.tc.external_hits = false;
         else if (a == "--frames") opt.max_frames = strtoull(val().c_str(), nullptr, 10);
         else if (a == "--stats") opt.stats_s = atof(val().c_str());
         else if (a == "--verbose" || a == "-v") opt.verbose = true;
@@ -596,6 +601,8 @@ int main(int argc, char **argv) {
     FrameMeta last_meta;
     auto next_allowed = Clock::now();
     int last_view = -1;
+    uint64_t last_pub_seq = 0, stats_late = 0;  // --lights-signs: newest published seq, light updates too late
+    std::vector<EndedTrack> carry;               // ended tracks of light updates older than the last message
 
     auto publish = [&](const FrameMeta &m, double ms, const Timing *t) {
         crop_paths.clear();
@@ -632,6 +639,8 @@ int main(int argc, char **argv) {
                 std::lock_guard<std::mutex> lk(prop_mu);
                 proposals.clear();
             }
+            last_pub_seq = 0;
+            carry.clear();
             reports.clear();
             ended.clear();
             tracker.flush(ended);
@@ -654,10 +663,19 @@ int main(int argc, char **argv) {
                 cv.y_stride = int(fv.y_stride), cv.uv_stride = int(fv.uv_stride);
                 ended.clear();
                 tracker.update(sp.seq, cv, sp.dets, reports, ended, sp.seen);
-                FrameMeta pm;
-                pm.seq = sp.seq, pm.ts_mono_ns = sp.ts_mono_ns, pm.ts_real_ns = sp.ts_real_ns;
-                last_view = 2;  // a light frame
-                publish(pm, 0.0, nullptr);
+                if (sp.seq > last_pub_seq) {  // in order: a `signs` message of its own (view 2 = a light frame)
+                    FrameMeta pm;
+                    pm.seq = sp.seq, pm.ts_mono_ns = sp.ts_mono_ns, pm.ts_real_ns = sp.ts_real_ns;
+                    last_view = 2;
+                    if (!carry.empty()) ended.insert(ended.begin(), std::make_move_iterator(carry.begin()),
+                                                     std::make_move_iterator(carry.end())), carry.clear();
+                    publish(pm, 0.0, nullptr);
+                    last_pub_seq = sp.seq;
+                } else {  // older than the last message: no message (seq stays monotonic); its ended tracks go
+                          // out with the next one
+                    for (EndedTrack &e : ended) carry.push_back(std::move(e));
+                    ++stats_late;
+                }
             }
         }
         if (fv.format != kFormatNV12 || (fv.width & 1) || (fv.height & 1)) {
@@ -695,7 +713,10 @@ int main(int argc, char **argv) {
         m.ts_mono_ns = fv.ts_mono_ns;
         m.ts_real_ns = fv.ts_real_ns;
         last_meta = m;
+        if (!carry.empty()) ended.insert(ended.begin(), std::make_move_iterator(carry.begin()),
+                                         std::make_move_iterator(carry.end())), carry.clear();
         publish(m, detect_ms, &t);
+        last_pub_seq = std::max(last_pub_seq, fv.seq);
         ++processed;
         ++stats_n;
         stats_ms += detect_ms;
@@ -713,6 +734,8 @@ int main(int argc, char **argv) {
                     stats_n / el, stats_ms / stats_n, stats_det / stats_n, tracker.live(),
                     (unsigned long long)skipped, srv.client_count(), stats_wait / stats_n,
                     (unsigned long long)stats_ticks, (unsigned long long)stats_turns);
+            if (opt.lights_signs) fprintf(stderr, "signd: lights-signs: %llu light updates older than the last message\n",
+                                          (unsigned long long)stats_late);
             stats_t0 = Clock::now();
             stats_n = 0;
             stats_ms = stats_det = stats_wait = 0;

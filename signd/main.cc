@@ -27,6 +27,7 @@
 #include <string>
 #include <thread>
 
+#include "governor.h"
 #include "gpusched.h"
 #include "jsonsock.h"
 #include "lights.h"
@@ -484,7 +485,9 @@ int main(int argc, char **argv) {
         uint64_t l_last = 0, l_n = 0, l_frames = 0;
         double l_ms = 0, l_det = 0, l_wait = 0;
         auto l_stats_t0 = Clock::now(), l_next = Clock::now();
-        const auto period = std::chrono::microseconds(int64_t(1e6 / std::max(0.1, opt.lights_hz)));
+        // --lights-hz, lowered by the load governor's `lights_hz` cap under heat (roadsense camerad/governor.h);
+        // the tracker's ages count light frames, so they stretch in time with the rate.
+        roadsense::GovernorReader l_gov;
         while (g_run) {
             if (!lr.is_open() && !lr.open()) {
                 lsrv.service();
@@ -501,7 +504,7 @@ int main(int argc, char **argv) {
                 lsrv.service();
                 continue;
             }
-            l_next = Clock::now() + period;
+            l_next = Clock::now() + std::chrono::microseconds(int64_t(1e6 / std::max(0.5, l_gov.limit("lights_hz", opt.lights_hz))));
             if (lf.seq < l_last) lt.reset();
             l_last = lf.seq;
             if (lf.format != kFormatNV12 || (lf.width & 1) || (lf.height & 1)) continue;
@@ -564,6 +567,8 @@ int main(int argc, char **argv) {
         srv.publish(signs_json(m, ms, reports, ended, crop_paths, ex));
     };
 
+    roadsense::GovernorReader gov;
+    bool next_allowed_set = false;
     while (g_run) {
         if (!rr.is_open() && !rr.open()) {
             if (!waiting_logged) fprintf(stderr, "signd: waiting for ring %s\n", ring_path().c_str());
@@ -572,7 +577,10 @@ int main(int argc, char **argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             continue;
         }
-        if (opt.max_hz > 0) {  // duty cycle: wait out the period, then take the newest frame
+        // duty cycle: wait out the period, then take the newest frame. --max-hz (0 = as fast as the
+        // pipeline goes), lowered by the load governor's `signs_hz` cap under heat.
+        const double hz = gov.limit("signs_hz", opt.max_hz);
+        if (hz > 0 || next_allowed_set) {
             const auto now = Clock::now();
             if (now < next_allowed) {
                 srv.service();
@@ -584,7 +592,8 @@ int main(int argc, char **argv) {
             srv.service();
             continue;
         }
-        if (opt.max_hz > 0) next_allowed = Clock::now() + std::chrono::microseconds(int64_t(1e6 / opt.max_hz));
+        next_allowed_set = hz > 0;
+        if (hz > 0) next_allowed = Clock::now() + std::chrono::microseconds(int64_t(1e6 / hz));
         if (fv.seq < last_seq) {  // camerad restarted: the old tracks cannot continue
             reports.clear();
             ended.clear();

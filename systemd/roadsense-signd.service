@@ -4,6 +4,10 @@ PartOf=roadsense.target
 After=roadsense-camerad.service
 Wants=roadsense-camerad.service
 
+# --lights-road-users (roadsense lane L42): the light detector's road users (person, rider, car, truck, bus,
+# train, motor, bike) go out in every lights message, decoded from the inference that runs for the lights (no
+# extra detector run); the governor's first step pauses them. The optional road-user view (--lights-ru-roi, an
+# extra detector run for near road users) is not enabled here.
 [Service]
 Type=simple
 Slice=roadsense.slice
@@ -52,7 +56,7 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/shm/roadsense-frames
 # lights under 12 px 39 -> 81 %, drop-outs 4.8 -> 1.6 per minute of light-time. The roi2 rows assume the horizon near the
 # middle of the frame (the car's DVR camera, pitch not calibrated): adjust with the camera's pitch.
 # L21 (roadsense docs/lanes/L21-budget-and-models.md, 2026-11-18): lights at 5 Hz instead of 3 (each of the two views
-# 2.5 times a second; --lights-coast 3 --lights-road-users keeps the 0.6 s a missed light stays listed). On the replays the reported share of
+# 2.5 times a second; --lights-coast 3 keeps the 0.6 s a missed light stays listed). On the replays the reported share of
 # the light-time went from 95.5 to 98.3 % by day and 93.6 to 98.9 % at night, lights under 12 px 81 -> 93-96 %, drop-outs
 # 1.7-2.4 -> 0-0.2 per minute of light-time. It costs 36 % of a big core, paid for by envd's move to the little cores
 # (roadsense unit). State model: the first file of the list that is installed; lights_state_car_48x24.onnx is the BDD

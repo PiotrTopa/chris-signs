@@ -48,9 +48,11 @@ Why this one (BDD100K val, 2000-image subset, 5533 lights, AP50 at IoU 0.5): COC
 far fewer lights (AP50 10.4 at 640x384, 25.3 at 1280x736) than the BDD-trained one (49.6 / 67.8); there
 is no permissive (Apache/MIT) dashcam traffic-light detector that runs on the phone (Autoware's Apache
 YOLOX-s fine detector refines map ROIs of Japanese lights and is ~4x the compute (26.8 vs 6.5 GFLOPs at 640); COCO YOLOX-nano/tiny
-are COCO-class, not evaluated after the COCO YOLO11n result). A BDD-trained YOLOv8n (pure convolutions,
-fully on Vulkan) exists (`dronefreak/bdd100k-yolov8n`, card mAP50 64.5 for lights) but was not evaluated
-in L7.
+are COCO-class, not evaluated after the COCO YOLO11n result). The BDD-trained YOLOv8n of the same recipe
+(`dronefreak/bdd100k-yolov8n`, commit `2c24162`, all 212 ncnn layers on Vulkan) was compared in roadsense lane
+L26 (`docs/lanes/L26-lights-yolov8n.md`) and rejected: +1.8 AP50 in the wide view on BDD100K val, but after
+the tracker on the replay rides less light-time (97.0 vs 97.4 % by day, 95.3 vs 98.6 % and 92.9 vs 98.9 % at
+night) and fewer far lights, with about 30 % more arithmetic; int8 does not change that.
 
 ## State CNN (trained here)
 

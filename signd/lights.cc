@@ -32,6 +32,43 @@ std::string fmt(double v, int prec) {
 constexpr int kStH = 48, kStW = 24;  // state CNN input (H x W)
 }  // namespace
 
+const char *road_user_name(int cls) {
+    static const char *n[] = {"person", "rider", "car", "truck", "bus", "train", "motor", "bike"};
+    return cls >= 0 && cls < 8 ? n[cls] : "unknown";
+}
+
+void pair_riders(std::vector<RoadUserDet> &v) {
+    // A rider stands on its vehicle: the two overlap horizontally by most of the narrower box, the rider's
+    // box reaches into the vehicle's and its centre is above the vehicle's. Best overlap first, one rider per
+    // vehicle.
+    std::vector<char> gone(v.size(), 0), taken(v.size(), 0);
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (v[i].cls != 1) continue;
+        const RoadUserDet &r = v[i];
+        int best = -1;
+        float best_ov = 0.f;
+        for (size_t j = 0; j < v.size(); ++j) {
+            if ((v[j].cls != 6 && v[j].cls != 7) || taken[j]) continue;
+            const RoadUserDet &b = v[j];
+            const float ox = std::min(r.x1, b.x1) - std::max(r.x0, b.x0);
+            const float ov = ox / std::max(1.f, std::min(r.x1 - r.x0, b.x1 - b.x0));
+            if (ov < 0.5f || r.y1 < b.y0 || (r.y0 + r.y1) > (b.y0 + b.y1) || ov <= best_ov) continue;
+            best = int(j), best_ov = ov;
+        }
+        if (best < 0) continue;
+        RoadUserDet &b = v[size_t(best)];
+        b.x0 = std::min(b.x0, r.x0), b.y0 = std::min(b.y0, r.y0), b.x1 = std::max(b.x1, r.x1), b.y1 = std::max(b.y1, r.y1);
+        b.score = std::max(b.score, r.score);
+        b.clip |= r.clip;
+        b.rider = true;
+        taken[size_t(best)] = 1, gone[i] = 1;
+    }
+    size_t k = 0;
+    for (size_t i = 0; i < v.size(); ++i)
+        if (!gone[i]) v[k++] = v[i];
+    v.resize(k);
+}
+
 const char *light_state_name(int s) {
     static const char *n[] = {"red", "yellow", "red_yellow", "green", "off", "unknown"};
     return s >= 0 && s < kNumLightStates ? n[s] : "unknown";
@@ -124,6 +161,7 @@ LightPipeline::LightPipeline(const LightsConfig &cfg) : cfg_(cfg) {
         fprintf(stderr, "signd: lights: state model %s not found, using the colour rule\n", cfg_.state.c_str());
         cfg_.state = "rule";
     }
+    ru_on_ = cfg_.road_users;
     if (cfg_.state != "rule") {
         RunnerOptions so;
         so.backend = "ort";
@@ -225,7 +263,8 @@ void LightPipeline::process(const Nv12View &f, std::vector<LightDet> &out, Light
     const float *o = out_.data(), *sc = o + size_t(4 + cfg_.cls_id) * N;
     std::vector<LightDet> cand;
     const float thr = cfg_.det_thr_keep > 0 ? std::min(cfg_.det_thr, cfg_.det_thr_keep) : cfg_.det_thr;
-    for (size_t i = 0; i < N; ++i) {
+    const bool lights_view = view != 2;                  // the road-user view decodes road users only
+    for (size_t i = 0; i < N && lights_view; ++i) {
         if (!(sc[i] > thr)) continue;
         const float cx = o[i], cy = o[N + i], w = o[2 * N + i], h = o[3 * N + i];
         LightDet d;
@@ -248,7 +287,7 @@ void LightPipeline::process(const Nv12View &f, std::vector<LightDet> &out, Light
         out.push_back(cand[i]);
     }
     signs_.clear();
-    if (cfg_.sign_cls >= 0 && cfg_.sign_cls < cfg_.n_cls) {  // sign proposals: same decode, own class row
+    if (lights_view && cfg_.sign_cls >= 0 && cfg_.sign_cls < cfg_.n_cls) {  // sign proposals: same decode, own class row
         const float *ss = o + size_t(4 + cfg_.sign_cls) * N;
         std::vector<LightDet> sc;
         for (size_t i = 0; i < N; ++i) {
@@ -272,8 +311,47 @@ void LightPipeline::process(const Nv12View &f, std::vector<LightDet> &out, Light
             signs_.push_back(sc[i]);
         }
     }
+    users_.clear();
+    if (ru_on_ || (view == 2 && cfg_.road_users)) {  // road users: same decode, the eight road classes, one class per box
+        const auto tu = Clock::now();
+        std::vector<RoadUserDet> uc;
+        float tmin = 1.f;
+        for (int c = 0; c < 8; ++c) tmin = std::min(tmin, cfg_.ru_thr[c]);
+        const float ex0 = float(rx0) + 2.f, ey0 = float(ry0) + 2.f, ex1 = float(std::min(rx1, double(f.width))) - 2.f,
+                    ey1 = float(std::min(ry1, double(f.height))) - 2.f;
+        for (size_t i = 0; i < N; ++i) {
+            int bc = 0;
+            float bs = o[4 * N + i];
+            for (int c = 1; c < 8; ++c) {
+                const float v = o[size_t(4 + c) * N + i];
+                if (v > bs) bs = v, bc = c;
+            }
+            if (!(bs > tmin) || !(bs > cfg_.ru_thr[bc])) continue;
+            const float cx = o[i], cy = o[N + i], w = o[2 * N + i], h = o[3 * N + i];
+            RoadUserDet d;
+            d.x0 = std::max(float(rx0 + (cx - w / 2) / r), 0.f);
+            d.y0 = std::max(float(ry0 + (cy - h / 2) / r), 0.f);
+            d.x1 = std::min(float(rx0 + (cx + w / 2) / r), float(f.width));
+            d.y1 = std::min(float(ry0 + (cy + h / 2) / r), float(f.height));
+            if (d.x1 - d.x0 < 3 || d.y1 - d.y0 < 3) continue;
+            d.score = bs, d.cls = bc;
+            for (int c = 0; c < 8; ++c) d.p[c] = o[size_t(4 + c) * N + i];
+            d.clip = (d.x0 <= ex0 ? 1 : 0) | (d.y0 <= ey0 ? 2 : 0) | (d.x1 >= ex1 ? 4 : 0) | (d.y1 >= ey1 ? 8 : 0);
+            uc.push_back(d);
+        }
+        std::stable_sort(uc.begin(), uc.end(), [](const RoadUserDet &a, const RoadUserDet &b) { return a.score > b.score; });
+        std::vector<char> ud(uc.size(), 0);
+        for (size_t i = 0; i < uc.size() && int(users_.size()) < cfg_.ru_max; ++i) {
+            if (ud[i]) continue;
+            for (size_t j = i + 1; j < uc.size(); ++j)
+                if (!ud[j] && iou4(&uc[i].x0, &uc[j].x0) > cfg_.ru_nms) ud[j] = 1;
+            users_.push_back(uc[i]);
+        }
+        pair_riders(users_);
+        t.users_ms = ms_since(tu);
+    }
     const auto t3 = Clock::now();
-    t.post_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+    t.post_ms = std::chrono::duration<double, std::milli>(t3 - t2).count() - t.users_ms;
     for (LightDet &d : out) classify(f, d);
     t.state_ms = ms_since(t3);
     t.total_ms = ms_since(t0);
@@ -430,9 +508,29 @@ void LightTracker::update(uint64_t, int64_t ts, const std::vector<LightDet> &det
 
 // ------------------------------------------------------------------ JSON ---
 
+std::string road_users_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, double ms, int frame_w, int frame_h,
+                            const float *roi, const std::vector<RoadUserDet> &users) {
+    char b[320];
+    snprintf(b, sizeof(b),
+             "{\"type\":\"road_users\",\"seq\":%" PRIu64 ",\"ts_mono_ns\":%" PRId64 ",\"ts_real_ns\":%" PRId64
+             ",\"ms\":%s,\"frame\":[%d,%d],\"roi\":[%s,%s,%s,%s],\"view\":2",
+             seq, ts_mono_ns, ts_real_ns, fmt(ms, 1).c_str(), frame_w, frame_h, fmt(roi[0] * frame_w, 0).c_str(),
+             fmt(roi[1] * frame_h, 0).c_str(), fmt(roi[2] * frame_w, 0).c_str(), fmt(roi[3] * frame_h, 0).c_str());
+    std::string s = b;
+    // the same list as in a `lights` message: reuse its writer on an empty light message and cut the key out
+    LightsConfig cfg;
+    std::vector<LightTrackReport> none;
+    const std::string l = lights_json(0, 0, 0, 0, frame_w, frame_h, cfg, none, nullptr, nullptr, 0, &users, 1);
+    const size_t k = l.find(",\"road_users\":");
+    s += l.substr(k, l.size() - 1 - k);
+    s += "}";
+    return s;
+}
+
 std::string lights_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, double lights_ms, int frame_w,
                         int frame_h, const LightsConfig &cfg, const std::vector<LightTrackReport> &tracks,
-                        const std::vector<LightDet> *raw, const LightsTiming *tm, int view) {
+                        const std::vector<LightDet> *raw, const LightsTiming *tm, int view,
+                        const std::vector<RoadUserDet> *users, int users_state) {
     const bool v2 = cfg.roi2[2] > cfg.roi2[0] && cfg.roi2[3] > cfg.roi2[1];
     const float *roi = view == 1 && v2 ? cfg.roi2 : cfg.roi;
     char b[512];
@@ -467,10 +565,36 @@ std::string lights_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, do
         }
         s += "]";
     }
+    if (users_state == 2) {
+        s += ",\"road_users\":null";
+    } else if (users_state == 1 && users) {
+        // {"cls", "score", "box" [x0,y0,x1,y1] frame px, "clip" (edges of the view's region the box touches: l t r b),
+        //  "rider" (bike / motor with its rider paired), "p" (the eight class scores, BDD100K order)}
+        s += ",\"road_users\":[";
+        for (size_t i = 0; i < users->size(); ++i) {
+            const RoadUserDet &d = (*users)[i];
+            char clip[5];
+            int n = 0;
+            if (d.clip & 1) clip[n++] = 'l';
+            if (d.clip & 2) clip[n++] = 't';
+            if (d.clip & 4) clip[n++] = 'r';
+            if (d.clip & 8) clip[n++] = 'b';
+            clip[n] = 0;
+            snprintf(b, sizeof(b),
+                     "%s{\"cls\":\"%s\",\"score\":%s,\"box\":[%s,%s,%s,%s],\"clip\":\"%s\",\"rider\":%s,"
+                     "\"p\":[%s,%s,%s,%s,%s,%s,%s,%s]}",
+                     i ? "," : "", road_user_name(d.cls), fmt(d.score, 3).c_str(), fmt(d.x0, 1).c_str(), fmt(d.y0, 1).c_str(),
+                     fmt(d.x1, 1).c_str(), fmt(d.y1, 1).c_str(), clip, d.rider ? "true" : "false", fmt(d.p[0], 2).c_str(),
+                     fmt(d.p[1], 2).c_str(), fmt(d.p[2], 2).c_str(), fmt(d.p[3], 2).c_str(), fmt(d.p[4], 2).c_str(),
+                     fmt(d.p[5], 2).c_str(), fmt(d.p[6], 2).c_str(), fmt(d.p[7], 2).c_str());
+            s += b;
+        }
+        s += "]";
+    }
     if (tm) {
-        snprintf(b, sizeof(b), ",\"timing\":{\"pre_ms\":%s,\"det_ms\":%s,\"post_ms\":%s,\"state_ms\":%s,\"wait_ms\":%s}",
+        snprintf(b, sizeof(b), ",\"timing\":{\"pre_ms\":%s,\"det_ms\":%s,\"post_ms\":%s,\"state_ms\":%s,\"wait_ms\":%s,\"users_ms\":%s}",
                  fmt(tm->pre_ms, 2).c_str(), fmt(tm->det_ms, 2).c_str(), fmt(tm->post_ms, 2).c_str(),
-                 fmt(tm->state_ms, 2).c_str(), fmt(tm->wait_ms, 2).c_str());
+                 fmt(tm->state_ms, 2).c_str(), fmt(tm->wait_ms, 2).c_str(), fmt(tm->users_ms, 3).c_str());
         s += b;
     }
     s += "}";

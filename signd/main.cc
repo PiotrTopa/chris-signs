@@ -196,6 +196,13 @@ void usage() {
             "                    message); default off. --lights-signs-keep: the same, but those boxes only continue\n"
             "                    tracks the sign detector started; --lights-signs-nohits: those boxes are not counted\n"
             "                    as hits (they keep a track alive and placed and vote)\n"
+            "  --lights-road-users  also publish the light detector's road users (person, rider, car, truck, bus, train,\n"
+            "                    motor, bike; riders paired with their vehicle) as `road_users` in every `lights`\n"
+            "                    message: no extra inference, paused by the governor's `road_users_hz` cap (\"road_users\":\n"
+            "                    null while shed); --lights-ru-thr LIST: per-class score thresholds, `name=x,...` or 8 numbers\n"
+            "  --lights-ru-roi x0,y0,x1,y1  with --lights-road-users: an EXTRA detector run on this part of the frame for\n"
+            "                    road users only (a `road_users` message, view 2), after the light frame, at most\n"
+            "                    --lights-ru-hz X a second (default 1); costs one detector run each; off by default\n"
             "  --lights-thr X (0.25)  --lights-state rule|PATH.onnx[,PATH2.onnx...] (rule; of a list the first\n"
             "                    file that exists is used)  --lights-timing\n"
             "  --frames N        exit after N processed frames (testing)\n"
@@ -206,6 +213,36 @@ void usage() {
             "        det_thr, cls_gate, nms_iou, cls_margin, max_age, min_hits, iou_match, dist_match, dist_match_new, crop_margin, max_crops, max_hz,\n"
             "        appearance, verifier, glow_px, glow_share, glow_alone, verify_thr, verify_vouch, class_min_score (CLI wins)\n"
             "env: ROADSENSE_RUNDIR (default /run/roadsense), ROADSENSE_RING (default /dev/shm/roadsense-frames)\n");
+}
+
+// --lights-ru-thr: "person=0.4,car=0.45" (names of road_user_name()) or eight numbers in class order.
+bool parse_ru_thr(const std::string &s, float *thr) {
+    if (s.find('=') == std::string::npos) {
+        float v[8];
+        const char *p = s.c_str();
+        for (int i = 0; i < 8; ++i) {
+            char *e;
+            v[i] = strtof(p, &e);
+            if (e == p) return false;
+            p = *e == ',' ? e + 1 : e;
+        }
+        std::copy(v, v + 8, thr);
+        return true;
+    }
+    size_t a = 0;
+    while (a < s.size()) {
+        const size_t b = std::min(s.find(',', a), s.size());
+        const std::string kv = s.substr(a, b - a);
+        const size_t q = kv.find('=');
+        if (q == std::string::npos) return false;
+        int c = -1;
+        for (int i = 0; i < 8; ++i)
+            if (kv.compare(0, q, roadsense::signs::road_user_name(i)) == 0 && q == strlen(roadsense::signs::road_user_name(i))) c = i;
+        if (c < 0) return false;
+        thr[c] = strtof(kv.c_str() + q + 1, nullptr);
+        a = b + 1;
+    }
+    return true;
 }
 
 void load_config(Options &o) {
@@ -258,6 +295,9 @@ void load_config(Options &o) {
     if (json_number(s, "lights_hz", &v)) o.lights_hz = v;
     if (json_number(s, "lights_threads", &v)) o.lc.threads = int(v);
     if (json_number(s, "lights_thr", &v)) o.lc.det_thr = float(v);
+    if (json_number(s, "lights_road_users", &v)) o.lc.road_users = v != 0;
+    if (json_string(s, "lights_ru_thr", &str) && !parse_ru_thr(str, o.lc.ru_thr))
+        fprintf(stderr, "signd: bad lights_ru_thr in signd.json\n");
 }
 
 bool parse_floats(const std::string &s, float *out, int n) {
@@ -349,6 +389,13 @@ int main(int argc, char **argv) {
         else if (a == "--lights-state") opt.lc.state = val();
         else if (a == "--lights-timing") opt.lights_timing = true;
         else if (a == "--lights-signs") opt.lights_signs = true, opt.lc.sign_cls = 9;
+        else if (a == "--lights-road-users") opt.lc.road_users = true;
+        else if (a == "--lights-ru-roi") {
+            if (!parse_floats(val(), opt.lc.ru_roi, 4)) return usage(), 2;
+        } else if (a == "--lights-ru-hz") opt.lc.ru_hz = atof(val().c_str());
+        else if (a == "--lights-ru-thr") {
+            if (!parse_ru_thr(val(), opt.lc.ru_thr)) return usage(), 2;
+        }
         else if (a == "--lights-signs-thr") opt.lc.sign_thr = float(atof(val().c_str()));
         else if (a == "--lights-signs-keep") opt.lights_signs = true, opt.lc.sign_cls = 9, opt.tc.external_starts = false;
         else if (a == "--lights-signs-nohits") opt.tc.external_hits = false;
@@ -476,6 +523,10 @@ int main(int argc, char **argv) {
         if (lp->has_view2())
             fprintf(stderr, "signd: lights: second view roi %.3f,%.3f,%.3f,%.3f on every other frame\n", opt.lc.roi2[0],
                     opt.lc.roi2[1], opt.lc.roi2[2], opt.lc.roi2[3]);
+        if (opt.lc.road_users)
+            fprintf(stderr, "signd: lights: road users on (thr %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f; governor key road_users_hz)\n",
+                    opt.lc.ru_thr[0], opt.lc.ru_thr[1], opt.lc.ru_thr[2], opt.lc.ru_thr[3], opt.lc.ru_thr[4], opt.lc.ru_thr[5],
+                    opt.lc.ru_thr[6], opt.lc.ru_thr[7]);
         fprintf(stderr, "signd: lights: thr %.2f keep %.2f, coast %d frames\n", opt.lc.det_thr, opt.lc.det_thr_keep,
                 opt.ltc.report_coast);
         fprintf(stderr, "signd: lights: %s on %s, input %dx%d, roi %.2f,%.2f,%.2f,%.2f, %.1f Hz, state %s, cpus %s%s\n",
@@ -515,7 +566,9 @@ int main(int argc, char **argv) {
         std::vector<LightTrackReport> lrep;
         uint64_t l_last = 0, l_n = 0, l_frames = 0;
         double l_ms = 0, l_det = 0, l_wait = 0;
-        auto l_stats_t0 = Clock::now(), l_next = Clock::now();
+        auto l_stats_t0 = Clock::now(), l_next = Clock::now(), u_next = Clock::now(), ru_next = Clock::now();
+        double ru_ms = 0;
+        uint64_t ru_n = 0;
         // --lights-hz, lowered by the load governor's `lights_hz` cap under heat (roadsense camerad/governor.h);
         // the tracker's ages count light frames, so they stretch in time with the rate.
         roadsense::GovernorReader l_gov;
@@ -544,6 +597,16 @@ int main(int argc, char **argv) {
             v.y_stride = int(lf.y_stride), v.uv_stride = int(lf.uv_stride);
             LightsTiming t;
             const int view = lp->has_view2() ? int(l_frames++ & 1) : 0;   // wide, zoom, wide, ...
+            // road users (non-critical): paused by the governor's `road_users_hz` cap (0), thinned by a positive one
+            int users_state = 0;
+            if (opt.lc.road_users) {
+                const double ucap = l_gov.cap("road_users_hz");
+                const auto un = Clock::now();
+                const bool due = ucap < 0 || (ucap > 0 && un >= u_next);
+                if (due && ucap > 0) u_next = un + std::chrono::microseconds(std::max<int64_t>(0, int64_t(1e6 / ucap) - 20000));
+                lp->set_road_users(due);
+                users_state = due ? 1 : (ucap == 0 ? 2 : 0);
+            }
             try {
                 lp->process(v, ld, &t, view);
             } catch (const std::exception &e) {
@@ -559,7 +622,8 @@ int main(int argc, char **argv) {
             lt.update(lf.seq, lf.ts_mono_ns, ld, lrep, seen);
             const double ms = t.total_ms + std::chrono::duration<double, std::milli>(Clock::now() - tt0).count();
             lsrv.publish(lights_json(lf.seq, lf.ts_mono_ns, lf.ts_real_ns, ms, v.width, v.height, lp->config(), lrep,
-                                     opt.lights_timing ? &ld : nullptr, opt.lights_timing ? &t : nullptr, view));
+                                     opt.lights_timing ? &ld : nullptr, opt.lights_timing ? &t : nullptr, view,
+                                     &lp->road_users(), users_state));
             if (opt.lights_signs) {  // sign proposals of this light frame -> sign classifier -> sign thread
                 SignProposals sp;
                 sp.seq = lf.seq, sp.ts_mono_ns = lf.ts_mono_ns, sp.ts_real_ns = lf.ts_real_ns;
@@ -574,14 +638,34 @@ int main(int argc, char **argv) {
                 std::lock_guard<std::mutex> lk(prop_mu);
                 if (proposals.size() < 8) proposals.push_back(std::move(sp));
             }
+            if (lp->has_ru_view() && users_state != 2) {  // the road-user view: after the light frame, never before it
+                const double ucap = l_gov.cap("road_users_hz");
+                const double hz = ucap > 0 ? std::min(ucap, opt.lc.ru_hz) : opt.lc.ru_hz;
+                const auto un = Clock::now();
+                if (ucap != 0 && hz > 0 && un >= ru_next) {
+                    ru_next = un + std::chrono::microseconds(int64_t(1e6 / hz));
+                    std::vector<LightDet> none;
+                    LightsTiming t3;
+                    try {
+                        lp->process(v, none, &t3, 2);
+                        lsrv.publish(road_users_json(lf.seq, lf.ts_mono_ns, lf.ts_real_ns, t3.total_ms, v.width, v.height,
+                                                     lp->view_roi(2), lp->road_users()));
+                        ru_ms += t3.total_ms, ++ru_n;
+                    } catch (const std::exception &e) {
+                        fprintf(stderr, "signd: road-user view failed: %s\n", e.what());
+                    }
+                }
+            }
             ++l_n, l_ms += ms, l_det += t.det_ms, l_wait += t.wait_ms;
             const double el = std::chrono::duration<double>(Clock::now() - l_stats_t0).count();
             if (opt.stats_s > 0 && el >= opt.stats_s) {
                 fprintf(stderr, "signd: lights %.2f fps, lights_ms %.1f (det %.1f), gpu wait %.1f ms, turns %llu, live %zu, clients %zu\n",
                         l_n / el, l_ms / std::max<uint64_t>(1, l_n), l_det / std::max<uint64_t>(1, l_n),
                         l_wait / std::max<uint64_t>(1, l_n), (unsigned long long)l_turns, lt.live(), lsrv.client_count());
+                if (ru_n)
+                    fprintf(stderr, "signd: road-user view %.2f runs/s, %.1f ms\n", ru_n / el, ru_ms / double(ru_n));
                 l_stats_t0 = Clock::now();
-                l_n = 0, l_ms = l_det = l_wait = 0, l_turns = 0;
+                l_n = 0, l_ms = l_det = l_wait = 0, l_turns = 0, ru_ms = 0, ru_n = 0;
             }
         }
         lsrv.close();

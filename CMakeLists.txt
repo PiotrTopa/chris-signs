@@ -128,5 +128,9 @@ add_test(NAME lights_tracker COMMAND lights_tracker_test)
 add_executable(signs_tracker_test tools/signs_tracker_test.cc)
 target_link_libraries(signs_tracker_test PRIVATE signd_core)
 add_test(NAME signs_tracker COMMAND signs_tracker_test)
+# Road users of the light detector (roadsense lane L42): rider pairing and the message key, no model needed
+add_executable(road_users_test tools/road_users_test.cc)
+target_link_libraries(road_users_test PRIVATE signd_core)
+add_test(NAME road_users COMMAND road_users_test)
 
 install(TARGETS signd signd_replay lights_replay RUNTIME DESTINATION bin)

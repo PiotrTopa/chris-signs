@@ -99,6 +99,7 @@ void usage() {
             "  --state rule|PATH.onnx (rule)   --threads N (2)   --cpus LIST (none)   --ncnn-fp32  --ncnn-no-flushall\n"
             "  --roi2 x0,y0,x1,y1  second view on every other processed frame (none)   --thr-keep X (off)   --coast N (0)\n"
             "  --dt-ms X  time between processed frames for the tracker (200)\n"
+            "  --road-users  also decode the road users (signd --lights-road-users) into each message\n"
             "  --both     with --roi2: run both views on every frame (detections merged by NMS) instead of alternating\n"
             "  --size WxH (raw NV12)  --every N (1)  --max-frames N  --repeat N  --no-track  --bench N (time N more passes)\n");
 }
@@ -158,6 +159,7 @@ int main(int argc, char **argv) {
         else if (a == "--no-track") track = false;
         else if (a == "--both") both = true;
         else if (a == "--bench") bench = atoi(val().c_str());
+        else if (a == "--road-users") lc.road_users = true;
         else if (a == "--help" || a == "-h") return usage(), 0;
         else if (!a.empty() && a[0] == '-') return usage(), 2;
         else files.push_back(a);
@@ -190,7 +192,7 @@ int main(int argc, char **argv) {
     LightTracker tracker(tc);
     std::vector<LightDet> dets;
     std::vector<LightTrackReport> reps;
-    std::vector<double> t_pre, t_det, t_state, t_total;
+    std::vector<double> t_pre, t_det, t_state, t_total, t_users;
     uint64_t seq = 0;
     Nv12Image frame;
     auto run = [&](const Nv12View &v) {
@@ -223,7 +225,9 @@ int main(int argc, char **argv) {
         const float seen[4] = {vr[0] * v.width, vr[1] * v.height, vr[2] * v.width, vr[3] * v.height};
         if (track) tracker.update(seq, ts, dets, reps, seen);
         else reps.clear();
-        printf("%s\n", lights_json(seq, ts, 0, t.total_ms, v.width, v.height, pipe->config(), reps, &dets, &t, view).c_str());
+        printf("%s\n", lights_json(seq, ts, 0, t.total_ms, v.width, v.height, pipe->config(), reps, &dets, &t, view,
+                                    &pipe->road_users(), lc.road_users ? 1 : 0).c_str());
+        t_users.push_back(t.users_ms);
         t_pre.push_back(t.pre_ms), t_det.push_back(t.det_ms), t_state.push_back(t.state_ms), t_total.push_back(t.total_ms);
     };
     for (const std::string &path : files) {
@@ -268,6 +272,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "lights_replay: %llu frames, median/p90 ms: pre %.1f/%.1f det %.1f/%.1f state %.2f/%.2f total %.1f/%.1f\n",
             (unsigned long long)seq, median(t_pre), pct(t_pre, 0.9), median(t_det), pct(t_det, 0.9), median(t_state),
             pct(t_state, 0.9), median(t_total), pct(t_total, 0.9));
+    if (lc.road_users)
+        fprintf(stderr, "lights_replay: road-user decode median/p90/max ms %.3f/%.3f/%.3f\n", median(t_users), pct(t_users, 0.9),
+                t_users.empty() ? 0.0 : *std::max_element(t_users.begin(), t_users.end()));
     if (bench > 0 && !frame.data.empty()) {
         std::vector<double> d;
         for (int i = 0; i < bench; ++i) {

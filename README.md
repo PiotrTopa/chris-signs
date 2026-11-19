@@ -10,6 +10,11 @@ With `--lights` a second thread also detects traffic lights (BDD100K YOLO11n on 
 upper part of the frame, a small state CNN, a tracker) and publishes `lights`
 messages on `<rundir>/lightd.sock`; models and licences in
 [docs/LIGHT_MODELS.md](docs/LIGHT_MODELS.md), offline runs with `lights_replay`.
+With `--lights-road-users` the same detector's road users (person, rider, car, truck,
+bus, train, motor, bike) go out in every `lights` message as well, from the inference
+that already runs for the lights (roadsense lane L42; section "Road users" of
+docs/LIGHT_MODELS.md); `--lights-ru-roi` adds an optional extra detector run on a lower
+band of the picture for the near road users.
 
 Split out of roadsense at commit
 [`246e68a`](https://github.com/PiotrTopa/roadsense/commit/246e68a) (where it

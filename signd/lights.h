@@ -43,6 +43,20 @@ struct LightsConfig {
     // scoring > sign_thr are kept too (sign_boxes()), for the sign classifier; -1 = off.
     int sign_cls = -1;
     float sign_thr = 0.35f;
+    // Road users (roadsense lane L42, signd --lights-road-users): boxes of the BDD100K classes 0..7 (person,
+    // rider, car, truck, bus, train, motor, bike) from the same detector output, decoded only when this is on;
+    // a rider is paired with the bike / motorbike under it into one road user. No extra inference: the cost is
+    // the decode (road_users()). Non-critical (display metadata), shed first by the governor (`road_users_hz`).
+    bool road_users = false;
+    float ru_thr[8] = {0.40f, 0.35f, 0.40f, 0.40f, 0.40f, 0.50f, 0.35f, 0.35f};  // per class
+    float ru_nms = 0.5f;           // class-agnostic NMS (one box, one class)
+    int ru_max = 40;
+    // Optional road-user view (view 2, signd --lights-ru-roi; off unless x1 > x0): an EXTRA detector run on this
+    // part of the frame, road users only, at most ru_hz a second, after the light frame is published (the lights
+    // never wait for it). The light views end at the horizon, so near road users there have no ground point; a
+    // lower band gives them one. It costs one detector run each time: off by default, shed first.
+    float ru_roi[4] = {0.f, 0.f, 0.f, 0.f};
+    double ru_hz = 1.0;
     float det_thr = 0.25f, nms_iou = 0.45f;
     // Boxes down to this score are kept for the tracker, which lets them continue an existing track but never
     // start one (0 = same as det_thr: every box may start a track, the behaviour before 2026-11-16).
@@ -66,8 +80,22 @@ struct LightDet {
     bool horizontal = false;
 };
 
+// One road user of a light frame (frame pixels). cls: 0 person, 1 rider (no vehicle found under it), 2 car,
+// 3 truck, 4 bus, 5 train, 6 motor, 7 bike; a paired rider makes its vehicle's box the union and sets `rider`.
+// clip: the box touches the edge of the view's region (bit 1 left, 2 top, 4 right, 8 bottom): a box cut at the
+// bottom gives no ground contact point. p: the eight class scores of the box (for the consumer's vote).
+struct RoadUserDet {
+    float x0, y0, x1, y1;
+    float score;
+    int cls;
+    int clip = 0;
+    bool rider = false;
+    float p[8];
+};
+const char *road_user_name(int cls);
+
 struct LightsTiming {
-    double pre_ms = 0, det_ms = 0, post_ms = 0, state_ms = 0, total_ms = 0, wait_ms = 0;
+    double pre_ms = 0, det_ms = 0, post_ms = 0, state_ms = 0, total_ms = 0, wait_ms = 0, users_ms = 0;
 };
 
 class LightPipeline {
@@ -80,12 +108,23 @@ public:
     // view 0 = cfg.roi, view 1 = cfg.roi2 (falls back to roi when no second view is configured).
     void process(const Nv12View &frame, std::vector<LightDet> &out, LightsTiming *t = nullptr, int view = 0);
     bool has_view2() const { return cfg_.roi2[2] > cfg_.roi2[0] && cfg_.roi2[3] > cfg_.roi2[1]; }
-    const float *view_roi(int view) const { return view == 1 && has_view2() ? cfg_.roi2 : cfg_.roi; }
+    bool has_ru_view() const { return cfg_.road_users && cfg_.ru_roi[2] > cfg_.ru_roi[0] && cfg_.ru_roi[3] > cfg_.ru_roi[1]; }
+    // view 2 = the road-user view (process() then decodes road users only: no lights, no sign proposals)
+    const float *view_roi(int view) const {
+        return view == 2 && has_ru_view() ? cfg_.ru_roi : view == 1 && has_view2() ? cfg_.roi2 : cfg_.roi;
+    }
     const LightsConfig &config() const { return cfg_; }
     const char *backend() const { return det_->name(); }
     bool has_state_cnn() const { return bool(st_); }
     // The sign proposals of the last process() call (empty unless cfg.sign_cls >= 0), frame pixels, NMS'd.
     const std::vector<LightDet> &sign_boxes() const { return signs_; }
+    // The road users of the last process() call (empty unless cfg.road_users and process() was asked to decode
+    // them), frame pixels, NMS'd, riders paired.
+    const std::vector<RoadUserDet> &road_users() const { return users_; }
+    // Decode road users in the next process() calls (the governor's `road_users_hz` pauses this); default on
+    // when cfg.road_users.
+    void set_road_users(bool on) { ru_on_ = on && cfg_.road_users; }
+    bool road_users_on() const { return ru_on_; }
     // GPU schedule hooks, as SignPipeline::before_det / after_det.
     std::function<void()> before_det, after_det;
 
@@ -97,7 +136,13 @@ private:
     std::vector<float> in_, out_, st_in_, st_out_;
     std::vector<float> rgb_;
     std::vector<LightDet> signs_;
+    std::vector<RoadUserDet> users_;
+    bool ru_on_ = false;
 };
+
+// Pairs riders with the bike / motorbike box under them (in place): the vehicle keeps its class, gets the
+// union box, `rider` and the higher score; the rider box goes. Exposed for tests.
+void pair_riders(std::vector<RoadUserDet> &v);
 
 // Colour rule on an RGB crop (planar float 0..1, w x h), vertical housing assumed unless horizontal:
 // lamp evidence per colour (red top, yellow middle, green bottom). Exposed for tests/tools.
@@ -170,9 +215,17 @@ private:
     int next_id_ = 1;
 };
 
+// The road-user view's message (view 2): {"type":"road_users","seq","ts_mono_ns","ts_real_ns","ms","frame","roi","view":2,
+// "road_users":[...]} on the light socket.
+std::string road_users_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, double ms, int frame_w, int frame_h,
+                            const float *roi, const std::vector<RoadUserDet> &users);
+
+// users: the frame's road users (key "road_users"), or nullptr; users_state: 0 = the key is left out
+// (--lights-road-users off), 1 = list, 2 = shed by the governor ("road_users": null).
 std::string lights_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, double lights_ms, int frame_w,
                         int frame_h, const LightsConfig &cfg, const std::vector<LightTrackReport> &tracks,
-                        const std::vector<LightDet> *raw = nullptr, const LightsTiming *timing = nullptr, int view = 0);
+                        const std::vector<LightDet> *raw = nullptr, const LightsTiming *timing = nullptr, int view = 0,
+                        const std::vector<RoadUserDet> *users = nullptr, int users_state = 0);
 
 }  // namespace signs
 }  // namespace roadsense

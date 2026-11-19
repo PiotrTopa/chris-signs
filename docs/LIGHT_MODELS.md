@@ -118,3 +118,41 @@ python tools/lights/car_state_eval.py SCAN.npz SHEETS old.onnx car_48x24.onnx
 Licence as for the first model: BDD100K (research / non-commercial) plus the owner's own frames; the weights
 and the labelled sample stay local. `signd --lights-state A.onnx,B.onnx` takes the first file that exists, so
 the unit names the car model first and the BDD model as the one to fall back to.
+
+## Road users from the same detector (`signd --lights-road-users`, 2026-11-19)
+
+Roadsense lane L42 (`docs/lanes/L42-road-users.md` there). The detector above is trained on all ten BDD100K
+classes; the light thread used only class 8. With `--lights-road-users` it also decodes classes 0-7 (person,
+rider, car, truck, bus, train, motor, bike) from the same output, one class per box (the best of the eight,
+class-agnostic NMS 0.5, per-class thresholds `--lights-ru-thr`, default person 0.40, rider 0.35, car 0.40,
+truck 0.40, bus 0.40, train 0.50, motor 0.35, bike 0.35, set before any labelling), pairs a rider with the bike
+or motorbike under it into one road user, and lists them in every `lights` message as `road_users` (`cls`,
+`score`, `box`, `clip`, `rider`, `p`). No extra detector run: the decode costs 0.04 ms median, 0.44 ms max per
+light frame on the laptop (4500 frames of a ride, ncnn-cpu); the rest of the message is byte-identical with the
+flag on or off. The load governor's first step (`road_users_hz` 0) pauses it (`"road_users": null`).
+
+What the views see: the wide view ends at 62 % of the frame height, about 64 px below the car camera's horizon,
+so a road user nearer than about 19 m is cut at the bottom (`clip` "b") and has no ground contact point for a
+distance (the second view: nearer than about 40 m). `--lights-ru-roi x0,y0,x1,y1` (with `--lights-ru-hz`, default
+1) adds an extra detector run on a lower band, road users only, after the light frame (a `road_users` message,
+view 2); it costs one detector run each time and is off by default.
+
+Accuracy on the car's camera, labelled by eye before scoring (`tools/road_users/sheets.py dets`, 216 boxes of
+views 0 and 1, stratified by the detector's class, score >= 0.3, box height >= 14 px, the class not shown on the
+sheets; one labeller; boxes of the same object in neighbouring seconds are not independent):
+
+| label \ detector | bike | bus | car | motorbike | person | truck | dropped (below threshold) | n |
+|---|---|---|---|---|---|---|---|---|
+| bike (cyclist or bicycle) | 19 | | | | | | 3 | 22 |
+| bus | | 35 | | | | 1 | 2 | 38 |
+| car | | | 35 | 1 | | 6 | 11 | 53 |
+| van | | 1 | 1 | | | 11 | 7 | 20 |
+| truck | | | | | | 12 | 4 | 16 |
+| tram | | 3 | | | | | 1 | 4 |
+| person | 5 | | | | 38 | | 5 | 48 |
+| other (no road user, part of one, unreadable) | 2 | | 5 | 1 | 2 | | 5 | 15 |
+
+Precision of the kept boxes: person 0.95, bus 0.90 (trams called bus), car 0.88 (a van counted right as car:
+the detector has no van class), bike 0.73 (most bikes are parked bicycles; pedestrians beside bicycles called
+bike), truck 0.40 (BDD100K's truck takes in the vans: 11 of 30 truck calls are vans, 6 are cars), motorbike 0/2.
+No `train` box in 12 576 frames. Reproduce: `tools/road_users/car_scan.py`, `sheets.py dets`, `score.py`.

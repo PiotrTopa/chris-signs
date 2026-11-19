@@ -10,13 +10,16 @@ NAMES = ["person", "rider", "car", "truck", "bus", "train", "motor", "bike"]
 THR = {"person": 0.40, "rider": 0.35, "car": 0.40, "truck": 0.40, "bus": 0.40, "train": 0.50, "motor": 0.35, "bike": 0.35}
 TO_LABEL = {"person": "person", "rider": "bike", "bike": "bike", "motor": "motorbike", "car": "car", "truck": "truck",
             "bus": "bus", "train": "tram"}
-OK = {("van", "car"), ("van", "van")}
+OK = {("van", "car"), ("van", "van"), ("car", "generic"), ("van", "generic")}   # generic = the car shape
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dir")
     ap.add_argument("--thr", default="")
+    ap.add_argument("--screen", action="store_true",
+                    help="what the car's screen would draw from a single detection: a vehicle class below 0.5 is the "
+                         "generic car shape (`generic`), a person / bike / motorbike from 0.35")
     a = ap.parse_args()
     thr = dict(THR)
     for kv in filter(None, a.thr.split(",")):
@@ -32,6 +35,8 @@ def main():
         pred = TO_LABEL[c] if d["score"] > thr[c] else "dropped"
         if d.get("rider") and c in ("bike", "motor"):
             pred = TO_LABEL[c]
+        if a.screen and pred in ("truck", "bus", "tram") and d["score"] < 0.5:
+            pred = "generic"
         conf[(labels[n], pred)] += 1
     rows = sorted({k[0] for k in conf})
     cols = sorted({k[1] for k in conf})

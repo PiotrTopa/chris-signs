@@ -69,6 +69,18 @@ int main() {
                       "\"roi\":[0,238,1280,684],\"view\":2,\"road_users\":[{\"cls\":\"car\"", 0) == 0);
         CHECK(m.back() == '}' && m[m.size() - 2] == ']');
     }
+    {   // the idle announcement of the light thread (--lights-idle)
+        CHECK(lights_idle_hz("ZW.Z.W", 5.0) > 3.33 && lights_idle_hz("ZW.Z.W", 5.0) < 3.34);
+        CHECK(lights_idle_hz("W...Z...", 5.0) == 1.25);
+        CHECK(lights_idle_hz("", 5.0) == 0);
+        LightsConfig cfg;
+        std::vector<LightTrackReport> none;
+        std::string m = lights_json(1, 2, 3, 1.0, 1280, 720, cfg, none);
+        CHECK(m.find("idle") == std::string::npos);
+        add_lights_idle(m, "ZW.Z.W", lights_idle_hz("ZW.Z.W", 5.0));
+        const std::string tail = ",\"idle\":{\"pattern\":\"ZW.Z.W\",\"hz\":3.33}}";
+        CHECK(m.size() > tail.size() && m.compare(m.size() - tail.size(), tail.size(), tail) == 0);
+    }
     if (failures) fprintf(stderr, "road_users_test: %d failure(s)\n", failures);
     else fprintf(stderr, "road_users_test: all passed\n");
     return failures ? 1 : 0;

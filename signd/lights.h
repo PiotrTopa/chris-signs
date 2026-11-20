@@ -227,5 +227,12 @@ std::string lights_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, do
                         const std::vector<LightDet> *raw = nullptr, const LightsTiming *timing = nullptr, int view = 0,
                         const std::vector<RoadUserDet> *users = nullptr, int users_state = 0);
 
+// Idle pattern (--lights-idle): the passes a second of `pattern` at `period_hz` frame periods a second (letters
+// other than '.' are passes), and the message key a consumer reads to judge the stream's rate while the light
+// detector tracks nothing: `,"idle":{"pattern":"ZW.Z.W","hz":3.33}` inserted before the message's closing brace.
+// Messages without the key come from the full schedule (a light is tracked, the pattern is off or forbidden).
+double lights_idle_hz(const std::string &pattern, double period_hz);
+void add_lights_idle(std::string &msg, const std::string &pattern, double hz);
+
 }  // namespace signs
 }  // namespace roadsense

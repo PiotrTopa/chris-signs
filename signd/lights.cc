@@ -527,6 +527,20 @@ std::string road_users_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns
     return s;
 }
 
+double lights_idle_hz(const std::string &pattern, double period_hz) {
+    if (pattern.empty() || period_hz <= 0) return 0;
+    size_t passes = 0;
+    for (char c : pattern) passes += c != '.';
+    return period_hz * double(passes) / double(pattern.size());
+}
+
+void add_lights_idle(std::string &msg, const std::string &pattern, double hz) {
+    if (msg.empty() || msg.back() != '}') return;
+    std::string p;
+    for (char c : pattern) p += (c == 'W' || c == 'Z' || c == '.') ? c : '?';  // JSON-safe whatever was configured
+    msg.insert(msg.size() - 1, ",\"idle\":{\"pattern\":\"" + p + "\",\"hz\":" + fmt(hz, 2) + "}");
+}
+
 std::string lights_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, double lights_ms, int frame_w,
                         int frame_h, const LightsConfig &cfg, const std::vector<LightTrackReport> &tracks,
                         const std::vector<LightDet> *raw, const LightsTiming *tm, int view,

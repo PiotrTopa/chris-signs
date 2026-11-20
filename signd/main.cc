@@ -598,7 +598,8 @@ int main(int argc, char **argv) {
                 std::this_thread::sleep_for(std::min(l_next - now, Clock::duration(std::chrono::milliseconds(20))));
                 continue;
             }
-            const auto l_period = std::chrono::microseconds(int64_t(1e6 / std::max(0.5, l_gov.limit("lights_hz", opt.lights_hz))));
+            const double l_hz = std::max(0.5, l_gov.limit("lights_hz", opt.lights_hz));
+            const auto l_period = std::chrono::microseconds(int64_t(1e6 / l_hz));
             int view = lp->has_view2() ? int(l_frames & 1) : 0;   // wide, zoom, wide, ...
             if (!opt.lights_idle.empty() && lt.live() == 0 && l_demand.cap("lights_idle") != 0) {
                 // nothing tracked: the idle pattern decides whether this period gets a pass, and of which view
@@ -650,9 +651,14 @@ int main(int argc, char **argv) {
             const float seen[4] = {vr[0] * v.width, vr[1] * v.height, vr[2] * v.width, vr[3] * v.height};
             lt.update(lf.seq, lf.ts_mono_ns, ld, lrep, seen);
             const double ms = t.total_ms + std::chrono::duration<double, std::milli>(Clock::now() - tt0).count();
-            lsrv.publish(lights_json(lf.seq, lf.ts_mono_ns, lf.ts_real_ns, ms, v.width, v.height, lp->config(), lrep,
-                                     opt.lights_timing ? &ld : nullptr, opt.lights_timing ? &t : nullptr, view,
-                                     &lp->road_users(), users_state));
+            std::string lmsg = lights_json(lf.seq, lf.ts_mono_ns, lf.ts_real_ns, ms, v.width, v.height, lp->config(), lrep,
+                                           opt.lights_timing ? &ld : nullptr, opt.lights_timing ? &t : nullptr, view,
+                                           &lp->road_users(), users_state);
+            // still nothing tracked after this pass and the pattern allowed: the next periods follow the pattern,
+            // and the message says so (consumers judge the stream's rate by it)
+            if (!opt.lights_idle.empty() && lt.live() == 0 && l_demand.cap("lights_idle") != 0)
+                add_lights_idle(lmsg, opt.lights_idle, lights_idle_hz(opt.lights_idle, l_hz));
+            lsrv.publish(lmsg);
             if (opt.lights_signs) {  // sign proposals of this light frame -> sign classifier -> sign thread
                 SignProposals sp;
                 sp.seq = lf.seq, sp.ts_mono_ns = lf.ts_mono_ns, sp.ts_real_ns = lf.ts_real_ns;

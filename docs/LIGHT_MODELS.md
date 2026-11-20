@@ -34,6 +34,18 @@ optional and off by default:
   (`frame_state` is `unknown`). Without it a light vanished from the message whenever one frame missed it,
   and with two views it would vanish on every other frame.
 
+Since 2026-11-20 (roadsense lane L48, measurements in roadsense `docs/lanes/L48-system-optimisation.md` section
+3.2), optional and off by default:
+
+* **Idle pattern** (`--lights-idle P`): while the tracker holds no track at all, the frame periods of
+  `--lights-hz` follow the pattern `P` instead of wide, zoom, wide, ...: one letter per period, `W` = wide pass,
+  `Z` = second view, `.` = no detector pass and no message. The first box that may start a track brings the full
+  schedule back with the next frame. `ZW.Z.W` (a third of the idle passes saved) scored inside the method's
+  noise on the two reference rides; every-other-period patterns did not. `<rundir>/demand` with
+  `"lights_idle":0` (roadsense docs/ARCHITECTURE.md, "Demand hints") forbids the pattern while valid.
+  `lights_replay --idle P` runs the same schedule offline; `--view-phase 1` gives the other phase of the normal
+  schedule as a noise estimate.
+
 ## Detector: dronefreak/bdd100k-yolo11n
 
 | | |

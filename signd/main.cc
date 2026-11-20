@@ -64,6 +64,13 @@ struct Options {
     LightsConfig lc;
     LightTrackerConfig ltc;
     double lights_hz = 3;
+    // While the light tracker holds no track at all (nothing to age, coast or re-state), the light frames follow
+    // this pattern instead of wide, zoom, wide, ...: one letter per frame period of --lights-hz, W = wide view,
+    // Z = second view, . = no detector pass. The first box brings the full schedule back with the next frame.
+    // Empty = off. A demand file (`<rundir>/demand`, key `lights_idle`, same format and validity rule as the
+    // governor's caps file) can forbid it while valid: 0 = never idle (the integrator, which knows the map and
+    // the car, writes it where signals are expected), 1 or absent = idle allowed.
+    std::string lights_idle;
     std::string lights_cpus;        // empty: same as --cpus
     bool lights_timing = false;
     bool lights_signs = false;      // --lights-signs: the light detector's `traffic sign` boxes go to the sign tracker
@@ -190,6 +197,9 @@ void usage() {
             "  --lights-thr-keep X  boxes down to this score continue a track, never start one (default: off)\n"
             "  --lights-coast N  report a confirmed track for N more light frames after its last match (default 0)\n"
             "  --lights-hz X     light frames per second (default 3)  --lights-threads N (2)  --lights-cpus LIST\n"
+            "  --lights-idle P   while no light is tracked at all, light frames follow the pattern P (one letter per frame\n"
+            "                    period: W wide view, Z second view, . no detector pass), e.g. Z.ZW; default off.\n"
+            "                    <rundir>/demand key lights_idle = 0 forbids it while valid (the integrator's hint)\n"
             "  --lights-signs    the light detector's `traffic sign` boxes (BDD100K class 9, score > --lights-signs-thr,\n"
             "                    default 0.35) are classified by the sign classifier and fed to the sign tracker as\n"
             "                    updates of their own (a `signs` message each, view 2, when not older than the last\n"
@@ -293,6 +303,7 @@ void load_config(Options &o) {
     if (json_string(s, "lights_state", &str)) o.lc.state = str;
     if (json_string(s, "lights_cpus", &str)) o.lights_cpus = str;
     if (json_number(s, "lights_hz", &v)) o.lights_hz = v;
+    if (json_string(s, "lights_idle", &str)) o.lights_idle = str;
     if (json_number(s, "lights_threads", &v)) o.lc.threads = int(v);
     if (json_number(s, "lights_thr", &v)) o.lc.det_thr = float(v);
     if (json_number(s, "lights_road_users", &v)) o.lc.road_users = v != 0;
@@ -383,6 +394,7 @@ int main(int argc, char **argv) {
         } else if (a == "--lights-thr-keep") opt.lc.det_thr_keep = float(atof(val().c_str()));
         else if (a == "--lights-coast") opt.ltc.report_coast = atoi(val().c_str());
         else if (a == "--lights-hz") opt.lights_hz = atof(val().c_str());
+        else if (a == "--lights-idle") opt.lights_idle = val();
         else if (a == "--lights-threads") opt.lc.threads = atoi(val().c_str());
         else if (a == "--lights-cpus") opt.lights_cpus = val();
         else if (a == "--lights-thr") opt.lc.det_thr = float(atof(val().c_str()));
@@ -572,6 +584,8 @@ int main(int argc, char **argv) {
         // --lights-hz, lowered by the load governor's `lights_hz` cap under heat (roadsense camerad/governor.h);
         // the tracker's ages count light frames, so they stretch in time with the rate.
         roadsense::GovernorReader l_gov;
+        roadsense::GovernorReader l_demand(rundir + "/demand");
+        uint64_t l_idle = 0, l_idle_at = 0;  // frame periods without a pass since the last stats line; pattern index
         while (g_run) {
             if (!lr.is_open() && !lr.open()) {
                 lsrv.service();
@@ -584,11 +598,26 @@ int main(int argc, char **argv) {
                 std::this_thread::sleep_for(std::min(l_next - now, Clock::duration(std::chrono::milliseconds(20))));
                 continue;
             }
+            const auto l_period = std::chrono::microseconds(int64_t(1e6 / std::max(0.5, l_gov.limit("lights_hz", opt.lights_hz))));
+            int view = lp->has_view2() ? int(l_frames & 1) : 0;   // wide, zoom, wide, ...
+            if (!opt.lights_idle.empty() && lt.live() == 0 && l_demand.cap("lights_idle") != 0) {
+                // nothing tracked: the idle pattern decides whether this period gets a pass, and of which view
+                const char c = opt.lights_idle[l_idle_at++ % opt.lights_idle.size()];
+                if (c == '.') {  // no pass and no message: consumers hold the last one, which lists no light
+                    ++l_idle;
+                    l_next = Clock::now() + l_period;
+                    lsrv.service();
+                    continue;
+                }
+                view = c == 'Z' && lp->has_view2() ? 1 : 0;
+            } else {
+                l_idle_at = 0;
+            }
             if (!lr.next(lf, 200)) {
                 lsrv.service();
                 continue;
             }
-            l_next = Clock::now() + std::chrono::microseconds(int64_t(1e6 / std::max(0.5, l_gov.limit("lights_hz", opt.lights_hz))));
+            l_next = Clock::now() + l_period;
             if (lf.seq < l_last) lt.reset();
             l_last = lf.seq;
             if (lf.format != kFormatNV12 || (lf.width & 1) || (lf.height & 1)) continue;
@@ -596,7 +625,7 @@ int main(int argc, char **argv) {
             v.y = lf.y, v.uv = lf.uv, v.width = int(lf.width), v.height = int(lf.height);
             v.y_stride = int(lf.y_stride), v.uv_stride = int(lf.uv_stride);
             LightsTiming t;
-            const int view = lp->has_view2() ? int(l_frames++ & 1) : 0;   // wide, zoom, wide, ...
+            l_frames = uint64_t(view) + 1;  // the alternation goes on from this view
             // road users (non-critical): paused by the governor's `road_users_hz` cap (0), thinned by a positive one
             int users_state = 0;
             if (opt.lc.road_users) {
@@ -664,6 +693,9 @@ int main(int argc, char **argv) {
                         l_wait / std::max<uint64_t>(1, l_n), (unsigned long long)l_turns, lt.live(), lsrv.client_count());
                 if (ru_n)
                     fprintf(stderr, "signd: road-user view %.2f runs/s, %.1f ms\n", ru_n / el, ru_ms / double(ru_n));
+                if (l_idle) fprintf(stderr, "signd: lights idle: %llu frame periods without a pass, %llu passes\n",
+                                    (unsigned long long)l_idle, (unsigned long long)l_n);
+                l_idle = 0;
                 l_stats_t0 = Clock::now();
                 l_n = 0, l_ms = l_det = l_wait = 0, l_turns = 0, ru_ms = 0, ru_n = 0;
             }

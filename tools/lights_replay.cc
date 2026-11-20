@@ -101,6 +101,11 @@ void usage() {
             "  --dt-ms X  time between processed frames for the tracker (200)\n"
             "  --road-users  also decode the road users (signd --lights-road-users) into each message\n"
             "  --both     with --roi2: run both views on every frame (detections merged by NMS) instead of alternating\n"
+            "  --idle P   while the tracker holds no track at all, the frames follow the pattern P instead of wide, zoom,\n"
+            "             wide, ...: one letter per frame, W = wide view, Z = second view, . = no detector pass (signd\n"
+            "             --lights-idle P), e.g. Z.ZW; a skipped frame prints the message a consumer still holds (no lights)\n"
+            "  --view-phase 1  start with the second view (zoom, wide, ...): the other phase of the same schedule\n"
+            "  --idle-every N  = --idle with W and Z alternating on every Nth frame (N=2: W.Z.)\n"
             "  --size WxH (raw NV12)  --every N (1)  --max-frames N  --repeat N  --no-track  --bench N (time N more passes)\n");
 }
 
@@ -122,7 +127,9 @@ int main(int argc, char **argv) {
     LightTrackerConfig tc;
     std::vector<std::string> files;
     std::string cpus = "none";
-    int raw_w = 0, raw_h = 0, every = 1, repeat = 1, bench = 0;
+    int raw_w = 0, raw_h = 0, every = 1, repeat = 1, bench = 0, idle_every = 1;
+    std::string idle_pat;
+    uint64_t view_phase = 0;  // 1: zoom, wide, zoom, ... (the other phase of the same schedule: a noise estimate)
     uint64_t max_frames = 0;
     bool track = true, both = false;
     double dt_ms = 200;
@@ -157,6 +164,11 @@ int main(int argc, char **argv) {
         else if (a == "--max-frames") max_frames = strtoull(val().c_str(), nullptr, 10);
         else if (a == "--repeat") repeat = std::max(1, atoi(val().c_str()));
         else if (a == "--no-track") track = false;
+        else if (a == "--idle-every") {
+            idle_every = std::max(1, atoi(val().c_str()));
+            idle_pat = "W" + std::string(size_t(idle_every - 1), '.') + "Z" + std::string(size_t(idle_every - 1), '.');
+        } else if (a == "--idle") idle_pat = val();
+        else if (a == "--view-phase") view_phase = uint64_t(std::max(0, atoi(val().c_str())));
         else if (a == "--both") both = true;
         else if (a == "--bench") bench = atoi(val().c_str());
         else if (a == "--road-users") lc.road_users = true;
@@ -193,11 +205,29 @@ int main(int argc, char **argv) {
     std::vector<LightDet> dets;
     std::vector<LightTrackReport> reps;
     std::vector<double> t_pre, t_det, t_state, t_total, t_users;
-    uint64_t seq = 0;
+    uint64_t seq = 0, passes = view_phase, idle_n = 0, skipped = 0;
     Nv12Image frame;
     auto run = [&](const Nv12View &v) {
         LightsTiming t;
-        const int view = pipe->has_view2() && !both ? int(seq & 1) : 0;   // wide, zoom, wide, ... like signd
+        // --idle: nothing tracked (no track of any age, so nothing to age or coast) -> the idle pattern decides
+        // whether this frame gets a detector pass and of which view. Time (seq) goes on either way.
+        int view = pipe->has_view2() && !both ? int(passes & 1) : 0;   // wide, zoom, wide, ... like signd
+        if (track && !idle_pat.empty() && tracker.live() == 0) {
+            const char c = idle_pat[idle_n++ % idle_pat.size()];
+            if (c == '.') {
+                ++seq, ++skipped;
+                const int64_t ts = int64_t(double(seq) * dt_ms * 1e6);
+                dets.clear(), reps.clear();
+                printf("%s\n", lights_json(seq, ts, 0, 0.0, v.width, v.height, pipe->config(), reps, &dets, &t, -1,
+                                            nullptr, 0).c_str());
+                return;
+            }
+            view = c == 'Z' && pipe->has_view2() ? 1 : 0;
+            passes = uint64_t(view);  // the alternation goes on from this view when a track starts
+        } else {
+            idle_n = 0;  // the next idle stretch starts at the pattern's first letter
+        }
+        ++passes;
         pipe->process(v, dets, &t, view);
         if (both && pipe->has_view2()) {  // second view on the same frame, merged by score-ordered NMS
             std::vector<LightDet> d2;
@@ -269,6 +299,9 @@ int main(int argc, char **argv) {
         }
         if (max_frames && seq >= max_frames) break;
     }
+    if (!idle_pat.empty())
+        fprintf(stderr, "lights_replay: idle %s: %llu of %llu frames without a detector pass (%.1f %%)\n", idle_pat.c_str(),
+                (unsigned long long)skipped, (unsigned long long)seq, seq ? 100.0 * double(skipped) / double(seq) : 0.0);
     fprintf(stderr, "lights_replay: %llu frames, median/p90 ms: pre %.1f/%.1f det %.1f/%.1f state %.2f/%.2f total %.1f/%.1f\n",
             (unsigned long long)seq, median(t_pre), pct(t_pre, 0.9), median(t_det), pct(t_det, 0.9), median(t_state),
             pct(t_state, 0.9), median(t_total), pct(t_total, 0.9));

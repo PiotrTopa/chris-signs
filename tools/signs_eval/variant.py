@@ -37,6 +37,8 @@ def main():
     ap.add_argument("--extra", default="")
     ap.add_argument("--lights", default="", help="LW,LZ: the light thread's sign proposals as tracker updates of their "
                     "own (as signd --lights-signs) on every cached frame of those sources, alternating")
+    ap.add_argument("--no-det", action="store_true", help="no sign-detector frames at all: the light thread's "
+                    "sign proposals (--lights) are the only tracker updates (signd --det none, lane L48)")
     ap.add_argument("--cache", default=f"{H}/datasets/l24s/cache")
     a = ap.parse_args(argv)
     base = f"{a.cache}/{a.slug}"
@@ -47,7 +49,7 @@ def main():
         have[nm] = set(int(f) for f in np.load(f"{base}.{nm}.npz")["frames"])
     lines, n, ne = [], 0, 0
     extras = [e for e in a.extra.split(",") if e]
-    while True:
+    while not a.no_det:
         f = int(np.floor(n * 20.0 / a.hz + 1e-9)) + a.phase
         if f >= nfr:
             break
@@ -63,6 +65,8 @@ def main():
         n += 1
     if lights:  # light-thread updates: 5 Hz alternating views on the frames where they are cached
         fr_l = sorted(set().union(*[have[l] for l in lights]))
+        if a.no_det and a.phase:  # the other phase of the two views (which view sees which frame)
+            fr_l = fr_l[a.phase:]
         sl = [(f, 1, f"{f} {lights[i % len(lights)]}") for i, f in enumerate(fr_l) if f in have[lights[i % len(lights)]]]
         sg = [(int(x.split()[0]), 0, x) for x in lines]
         lines = [x for _, _, x in sorted(sg + sl)]

@@ -6,10 +6,10 @@ set -u
 NAME=$1; PHASES=$2; VARGS=$3; RIDES=${4:-"krakow-2024 rural-zloczew forest-vistula-spit s1-roadworks warsaw-city katowice-rain"}
 PY=/home/piotr/l12/.venv/bin/python
 RPY=/home/piotr/projects/roadsense/.venv-models/bin/python
-T=/home/piotr/projects/wt/signs-l24s/tools/signs_eval
-RS=/home/piotr/projects/wt/roadsense-v2
+T=${T:-$(cd "$(dirname "$0")" && pwd)}
+RS=${RS:-/home/piotr/projects/wt/roadsense-v2}
 L11=$RS/docs/lanes/L11-signs-in-effect
-O=/home/piotr/datasets/l24s/eval/$NAME; mkdir -p $O
+O=${EVAL_DIR:-/home/piotr/datasets/l24s/eval}/$NAME; mkdir -p $O
 for P in $PHASES; do
   for s in $RIDES; do
     $PY -I $T/variant.py $s $O/${s}_p$P.jsonl --phase $P $VARGS || exit 1

@@ -35,7 +35,8 @@ optional and off by default:
   and with two views it would vanish on every other frame.
 
 Since 2026-11-20 (roadsense lane L48, measurements in roadsense `docs/lanes/L48-system-optimisation.md` section
-3.2), optional and off by default:
+3.2), off by default in the binary; **installed in the unit since 2026-11-21 (roadsense lane L53, owner's
+decision): `--lights-idle ZW.Z.W`**:
 
 * **Idle pattern** (`--lights-idle P`): while the tracker holds no track at all, the frame periods of
   `--lights-hz` follow the pattern `P` instead of wide, zoom, wide, ...: one letter per period, `W` = wide pass,
@@ -45,6 +46,32 @@ Since 2026-11-20 (roadsense lane L48, measurements in roadsense `docs/lanes/L48-
   `"lights_idle":0` (roadsense docs/ARCHITECTURE.md, "Demand hints") forbids the pattern while valid.
   `lights_replay --idle P` runs the same schedule offline; `--view-phase 1` gives the other phase of the normal
   schedule as a noise estimate.
+* **Idle announcement** (since L53): every `lights` message sent while the pattern runs and nothing is tracked
+  carries `"idle": {"pattern": "ZW.Z.W", "hz": 3.33}` (passes a second kept at the current `--lights-hz`, after the
+  governor's cap). A consumer judges the stream's rate by it: chris-integrator's `lights` floor is then
+  0.8 x `hz` instead of 3 a second, so an idle stream that keeps its pattern is not `slow` and one that falls
+  behind it is. Messages without `idle` come from the full schedule.
+* **Sparser patterns** (L53, laptop, the L48 method: `replay_score.py` on the first 5 minutes, every 4th frame,
+  against the L15 reference; noise = the normal schedule started on the other view: light-time 0.0 points by day
+  and by night, 0.7 at 24-48 px, first report 0.40 / 0.50 s):
+
+  | idle pattern | idle passes saved | light-time day | 24-48 px day | first report day | light-time night |
+  |---|---|---|---|---|---|
+  | none (wide, zoom, ...) | 0 | 97.1 % | 94.4 % | 0.40 s | 98.9 % |
+  | `ZW.Z.W` (installed) | 1/3 | 97.0 % | 93.3 % | 0.50 s | 99.5 % |
+  | one pass in 2 (`W.Z.` / `Z.W.`) | 1/2 | 96.8 / 96.7 % | 92.7 / 91.7 % | 0.50 / 0.40 s | 97.9 / 98.9 % |
+  | one pass in 3 (`W..Z..` / `Z..W..`) | 2/3 | 95.4 / 95.9 % | 86.0 / 87.4 % | 0.70 / 0.50 s | 97.9 / 96.3 % |
+  | one pass in 4 (`W...Z...` / `Z...W...`) | 3/4 | 96.0 / 94.9 % | 88.4 / 82.5 % | 0.50 / 0.50 s | 94.4 / 97.1 % |
+
+  Every pattern still reports every reference light at least once (27/27 by day, 16/16 by night). One pass in 2
+  passes the coarse lines (light-time within 1.5 points, first report +0.1 s) but loses **1.7-2.7 points of the
+  24-48 px (far) light-time against a noise of 0.7**: a measurable loss of far lights, so it is not installed;
+  one in 3 and one in 4 lose light-time by 1-4.5 points. On the phone's own backend (ncnn CPU fp16) one in 2
+  gives 96.6 % by day (24-48 px 91.7 against 93.6) and 97.4 % at night against 96.9 / 98.9 %; `ZW.Z.W` gives
+  96.8 / 99.5 %. Measured with `ZW.Z.W` on the phone (rural ride without lights): light thread 88 -> 59 % of a
+  big core, 0.41 W, 2 K on the big cores; with lights (krakow) 89 -> 76 %. Expected saving on idle roads of the
+  sparser patterns, that figure scaled by the passes saved (inferred): one in 2 about 0.6 W, one in 3 about
+  0.8 W, one in 4 about 0.9 W. Details: roadsense `docs/lanes/L53-owner-decisions.md`.
 
 ## Detector: dronefreak/bdd100k-yolo11n
 

@@ -195,3 +195,113 @@ Precision of the kept boxes: person 0.95, bus 0.90 (trams called bus), car 0.88 
 the detector has no van class), bike 0.73 (most bikes are parked bicycles; pedestrians beside bicycles called
 bike), truck 0.40 (BDD100K's truck takes in the vans: 11 of 30 truck calls are vans, 6 are cars), motorbike 0/2.
 No `train` box in 12 576 frames. Reproduce: `tools/road_users/car_scan.py`, `sheets.py dets`, `score.py`.
+
+## Image scale change per road user (`signd --lights-ru-scale`, 2026-11-23)
+
+With `--lights-road-users --lights-ru-scale` every road user may carry `scale_rate` (1/s, d ln(size)/dt of the
+object's IMAGE over the baseline, positive = growing = approaching), `scale_rate_std` (1/s, 1 sigma) and
+`scale_dt_s` (s, the baseline); the three keys come together and are absent when not measured. For an object
+ahead, closing speed / distance = `scale_rate` (time to contact 1 / `scale_rate`), independent of the object's
+true size, the camera pitch or the road slope (Stein, Mano, Shashua 2003; Dagan et al. 2004), and without the
+box edges' jitter (3 px, 10-15 % of a far car's height) that a rate from box heights carries. Code:
+`signd/scale.h`, `signd/scale.cc`; off by default (deployment: add the flag to the unit).
+
+How (per light pass, any view; boxes are full-frame pixels, so wide-view and zoom-view boxes of one object compare
+directly):
+
+* **Patches from the full-resolution luma** of the ring frame (1280x720), not from the detector's downscaled view:
+  a far car keeps its native pixels. Template = the central 80 % of the box, about 24x24 template pixels
+  whatever the aspect (long side up to 96 so a flat strip, e.g. a near car cut at the view's bottom, keeps its 8
+  rows); boxes up to ~28 px take raw integer-aligned pixels, larger ones are area-averaged to <= 0.66 scale.
+  At most 12 boxes a pass (largest first, `--lights-ru-scale-max`).
+* **Association** without a tracker: a box continues the chain (same class group: person/rider/bike/motor or
+  car/truck/bus/train) whose box, predicted with constant centre velocity and log-size rate, overlaps it best
+  (IoU >= 0.25); chains end after 1.2 s without a box.
+* **Baseline**: the chain's oldest patch 0.2-1.0 s back (`--lights-ru-scale-dt`); at the unit's schedule the
+  median baseline is 0.8 s.
+* **Alignment**: the current frame is resampled around the box at the box-ratio scale prior (a raw crop for
+  native templates, so the warp interpolates once and no image of the pair is blurrier than the other: double
+  interpolation biased far objects by -0.007/s in the first version); NCC over log scale (step 1/template
+  radius, 0.04-0.08, range +-0.08..0.28 from the box jitter) and integer shift (+-2..6, all shifts at the prior
+  scale, +-2 around that peak at the others); then Gauss-Newton on log scale, shift, gain and offset.
+* **Uncertainty**: residual variance x (J^T J)^-1, with the gradients' own noise removed from J^T J (errors in
+  variables), inflated by the residual's lag-1 autocorrelation per axis ((1+rho)/(1-rho)).
+* **No value** when the box touches the frame edge or is clipped on both sides of an axis by the view, the
+  template is under 8 px on a side or textureless (sd < 2.5 grey levels), the search image leaves the frame, the
+  NCC peak is < 0.7 or on the edge of the search range, the fit leaves the peak or does not converge, the fit's
+  R^2 < 0.6, or the stated 1-sigma of ln(scale) exceeds 0.06. A box clipped by the view on one side gets its
+  scale prior from the free axis and its position from the free edge.
+
+### Synthetic check (`build/scale_rate_test`, ctest `scale_rate`)
+
+Textured rectangle growing at a known rate over a static textured background, 4x4 supersampled, Gaussian noise
+3 grey levels, box edges jittered 2 px (4 px for the near case), 5 passes a second for 1.2 s, 60 random textures
+per case, values from 0.4 s on (dt 0.4-1.0 s):
+
+| case | coverage | bias (1/s) | scatter (1/s) | stated std (1/s) | rms pull | > 3 sigma | ms/box (laptop) |
+|---|---|---|---|---|---|---|---|
+| far 16 px, still | 87 % | +0.0003 | 0.0163 | 0.0126 | 1.04 | 0.0 % | 0.12 |
+| far 16 px, closing 0.15/s, moving | 89 % | -0.0027 | 0.0138 | 0.0108 | 1.20 | 1.9 % | 0.14 |
+| far 24 px, contrast 15, closing 0.10/s | 82 % | +0.0035 | 0.0223 | 0.0199 | 1.09 | 1.2 % | 0.29 |
+| mid 60 px, closing 0.30/s | 100 % | -0.0003 | 0.0029 | 0.0029 | 0.93 | 1.0 % | 0.37 |
+| mid 60 px, opening 0.20/s | 100 % | -0.0003 | 0.0030 | 0.0038 | 0.76 | 0.3 % | 0.37 |
+| near 180 px, closing 0.40/s | 100 % | +0.0002 | 0.0018 | 0.0019 | 0.86 | 0.3 % | 0.37 |
+| uniform (textureless) 60 px | 0 % | | | | | | |
+| cut by the frame edge | 0 % | | | | | | |
+| tiny 6 px | 0 % | | | | | | |
+
+Bias stays below a fifth of the scatter; the stated std is within 0.75-1.2 of the actual scatter.
+
+### Recorded data (`lights_replay --road-users --ru-scale --name-fps F`, ORT, `tools/road_users/scale_check.py`)
+
+The car's recorder sessions of 2026-11-22 (night, city, 1280x720 at **one frame per 1.03 s**, ego mean 3.7
+m/s) are too sparse for this: run with `--ru-scale-dt 0.2,1.6`, half the objects appear in one frame only or
+move too far in a second to be re-associated (13-14 % of 297 wide-view boxes measured), and successive estimates
+1 s apart of near leads in city traffic differ by real dynamics (14 pairs, rms z 3.7). The leads that held their
+distance read about 0 (rate x distance / ego speed in [-0.25, 0.25] for 13 of 16 boxes with ego > 3 m/s); no
+parked car passed at speed got two frames, so the v / x relation could not be checked. **A recording with
+every frame (or 5 a second) is needed** for an honest car-camera check: `roadsense-rec` with a 5 Hz frame rate
+on a day and a night drive with parked cars along the road.
+
+The ride library at 20 fps, cut to the unit's schedule (5 frame periods a second, wide / zoom alternating, idle
+pattern ZW.Z.W, `--lights-roi2 0.125,0.125,0.875,0.569`), frame times from the file names:
+
+| ride | boxes | measured | far boxes (size < 40 px) measured, median stated std | successive estimates, disjoint baselines |
+|---|---|---|---|---|
+| warsaw-city (day, 15 min, stop-and-go) | 1368 | 613 (45 %) | 57 of 159, 0.0086 /s (12-20 px: 79 %) | far: 51 pairs, rms z 1.28, 3.9 % > 3; both rates < 0.05: 447 pairs, rms z 1.49, 4.0 % > 3 |
+| krakow-night-tunnel (night, 5 min) | 195 | 70 (36 %) | 59 of 140, 0.046-0.056 /s | far: 48 pairs, rms z 0.68, 0 % > 3 |
+| a1-night (night motorway, 5 min) | 33 | 7 (21 %) | 7 of 23, 0.034-0.051 /s | 6 pairs, rms z 0.57 |
+| krakow-lights (day, 15 min) | 108 | 23 (21 %) | none | 18 near-object pairs, rms z 4.7 (dynamics) |
+
+Why boxes get no value (warsaw-city, 1368 boxes): first sighting of the object 287, box at the frame edge 175,
+clipped on both sides 62, no earlier patch in the window 63; of the 781 boxes that reached the alignment 613
+were measured (78 %), the rest failed NCC 35, fit 69, search edge 14, R^2 12, std 13, tiny 8, frame edge 17.
+
+Consistency of successive estimates is a noise check only where the true rate changes slowly: every pair
+beyond 3 sigma among the "slow" warsaw pairs is a car 4-6 m ahead (box 330-400 px wide, cut at the view's
+bottom) in a queue starting or stopping, where 0.25 m/s^2 changes the rate by 0.05/s within a second.
+
+Against modeld's lead on warsaw-city (lead prob > 0.5; our box in the path whose width matches a 1.8 m car at the
+lead's distance, 445 boxes): our value minus (v_ego - v_lead) / x_lead has median -0.0005/s, MAD 0.0021/s;
+examples x 6.4 m, model -0.323 vs ours -0.332 +- 0.018; x 6.1 m, -0.097 vs -0.107 +- 0.009; stopped leads
+model ~0 vs ours +-0.002 +- 0.005. (Ride views end above these cameras' horizon, so the boxes have no ground
+distance of their own and the parked-car v / x check needs the car's camera.)
+
+Against box differencing over the same baseline (same objects, the box-size ratio of the same two passes):
+the box rate scatters around the image rate by 0.065/s (far boxes < 40 px), 0.039/s (40-80 px), 0.014/s
+(> 80 px) on warsaw-city, where the image rate states 0.009, 0.009 and 0.005/s; at night (krakow-night-tunnel,
+far boxes) 0.096/s vs a stated 0.049/s. So by day a far object's rate is about 7x more precise from one pair of
+patches than from its box; at night (headlight-lit, taillights, low texture) about 2x.
+
+Cost (laptop, i7 class, one thread; per light pass with road users): median 0.001 ms (nothing to measure), p90
+0.7 ms, max 2.4 ms over 4500 warsaw-city frames; per measured box 0.12 ms (16 px) to 0.37 ms (60-180 px), so
+the 12-box cap bounds a pass at about 4.5 ms. On the phone's big cores (3-5x slower) about 0.4-1.9 ms per box,
+p90 2-4 ms and worst case 13-22 ms a pass at the cap; on a little core 10x. Memory: <= 64 chains x ~7 patches of
+<= ~1000 floats. The measurement runs after the detector, outside the GPU turn, and its time is in `lights_ms`
+(and `timing.scale_ms` with `--lights-timing`). No new dependencies.
+
+Reproduce: `lights_replay --backend ort --model bdd100k_yolo11n_320x960.onnx --roi2 0.125,0.125,0.875,0.569
+--thr-keep 0.12 --coast 3 --idle ZW.Z.W --road-users --ru-scale --name-fps 20 <ride frames 0,4,8,...>.jpg >
+out.jsonl` (reject counts on stderr), then `tools/road_users/scale_check.py out.jsonl --road
+<rides-road>/<ride>.road.jsonl.gz`; recorder sessions: `--name-fps 19.47 --ru-scale-dt 0.2,1.6`, then
+`scale_check.py out.jsonl --session <session dir>`.

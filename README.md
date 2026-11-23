@@ -15,6 +15,10 @@ bus, train, motor, bike) go out in every `lights` message as well, from the infe
 that already runs for the lights (roadsense lane L42; section "Road users" of
 docs/LIGHT_MODELS.md); `--lights-ru-roi` adds an optional extra detector run on a lower
 band of the picture for the near road users.
+`--lights-ru-scale` adds to each road user the image scale change (`scale_rate`,
+`scale_rate_std`, `scale_dt_s`: d ln(size)/dt from patch alignment against the same object
+0.2-1 s earlier, for range rate and time to contact; section "Image scale change" of
+docs/LIGHT_MODELS.md; checks: `build/scale_rate_test`, `tools/road_users/scale_check.py`).
 
 Split out of roadsense at commit
 [`246e68a`](https://github.com/PiotrTopa/roadsense/commit/246e68a) (where it

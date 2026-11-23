@@ -213,6 +213,10 @@ void usage() {
             "  --lights-ru-roi x0,y0,x1,y1  with --lights-road-users: an EXTRA detector run on this part of the frame for\n"
             "                    road users only (a `road_users` message, view 2), after the light frame, at most\n"
             "                    --lights-ru-hz X a second (default 1); costs one detector run each; off by default\n"
+            "  --lights-ru-scale  with --lights-road-users: image scale change per road user (patch alignment against\n"
+            "                    an earlier light frame, 0.2-1 s back): optional scale_rate, scale_rate_std (1/s),\n"
+            "                    scale_dt_s per box; --lights-ru-scale-max N boxes a pass (12, largest first),\n"
+            "                    --lights-ru-scale-dt MIN,MAX baseline window in s (0.2,1.0; the oldest patch inside it)\n"
             "  --lights-thr X (0.25)  --lights-state rule|PATH.onnx[,PATH2.onnx...] (rule; of a list the first\n"
             "                    file that exists is used)  --lights-timing\n"
             "  --frames N        exit after N processed frames (testing)\n"
@@ -307,6 +311,7 @@ void load_config(Options &o) {
     if (json_number(s, "lights_threads", &v)) o.lc.threads = int(v);
     if (json_number(s, "lights_thr", &v)) o.lc.det_thr = float(v);
     if (json_number(s, "lights_road_users", &v)) o.lc.road_users = v != 0;
+    if (json_number(s, "lights_ru_scale", &v)) o.lc.ru_scale = v != 0;
     if (json_string(s, "lights_ru_thr", &str) && !parse_ru_thr(str, o.lc.ru_thr))
         fprintf(stderr, "signd: bad lights_ru_thr in signd.json\n");
 }
@@ -405,6 +410,12 @@ int main(int argc, char **argv) {
         else if (a == "--lights-ru-roi") {
             if (!parse_floats(val(), opt.lc.ru_roi, 4)) return usage(), 2;
         } else if (a == "--lights-ru-hz") opt.lc.ru_hz = atof(val().c_str());
+        else if (a == "--lights-ru-scale") opt.lc.ru_scale = true;
+        else if (a == "--lights-ru-scale-max") opt.lc.ru_scale = true, opt.lc.ru_scale_max = atoi(val().c_str());
+        else if (a == "--lights-ru-scale-dt") {
+            opt.lc.ru_scale = true;
+            if (!parse_floats(val(), opt.lc.ru_scale_dt, 2)) return usage(), 2;
+        }
         else if (a == "--lights-ru-thr") {
             if (!parse_ru_thr(val(), opt.lc.ru_thr)) return usage(), 2;
         }
@@ -535,6 +546,8 @@ int main(int argc, char **argv) {
         if (lp->has_view2())
             fprintf(stderr, "signd: lights: second view roi %.3f,%.3f,%.3f,%.3f on every other frame\n", opt.lc.roi2[0],
                     opt.lc.roi2[1], opt.lc.roi2[2], opt.lc.roi2[3]);
+        if (opt.lc.road_users && opt.lc.ru_scale)
+            fprintf(stderr, "signd: lights: road-user scale rate on (at most %d boxes a pass)\n", opt.lc.ru_scale_max);
         if (opt.lc.road_users)
             fprintf(stderr, "signd: lights: road users on (thr %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f; governor key road_users_hz)\n",
                     opt.lc.ru_thr[0], opt.lc.ru_thr[1], opt.lc.ru_thr[2], opt.lc.ru_thr[3], opt.lc.ru_thr[4], opt.lc.ru_thr[5],
@@ -619,7 +632,7 @@ int main(int argc, char **argv) {
                 continue;
             }
             l_next = Clock::now() + l_period;
-            if (lf.seq < l_last) lt.reset();
+            if (lf.seq < l_last) lt.reset(), lp->reset_scale();
             l_last = lf.seq;
             if (lf.format != kFormatNV12 || (lf.width & 1) || (lf.height & 1)) continue;
             Nv12View v;
@@ -639,6 +652,7 @@ int main(int argc, char **argv) {
             }
             try {
                 lp->process(v, ld, &t, view);
+                if (users_state == 1) lp->measure_scale(v, lf.ts_mono_ns, &t);
             } catch (const std::exception &e) {
                 if (l_turn) gs.end_turn(0), l_turn = false;
                 if (l_mu) l_mu = false, gpu_mu.unlock();
@@ -683,6 +697,7 @@ int main(int argc, char **argv) {
                     LightsTiming t3;
                     try {
                         lp->process(v, none, &t3, 2);
+                        lp->measure_scale(v, lf.ts_mono_ns, &t3);
                         lsrv.publish(road_users_json(lf.seq, lf.ts_mono_ns, lf.ts_real_ns, t3.total_ms, v.width, v.height,
                                                      lp->view_roi(2), lp->road_users()));
                         ru_ms += t3.total_ms, ++ru_n;

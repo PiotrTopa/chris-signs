@@ -54,7 +54,7 @@ if(NOT SIGND_ORT_INCLUDE_DIR OR NOT SIGND_ORT_LIBRARY)
 endif()
 
 add_library(signd_core STATIC signd/yolo.cc signd/ort_runner.cc signd/tracker.cc signd/output.cc signd/lights.cc
-  signd/verify.cc)
+  signd/scale.cc signd/verify.cc)
 target_include_directories(signd_core PUBLIC ${CMAKE_SOURCE_DIR}/signd ${ROADSENSE_DIR}/camerad
   ${SIGND_ORT_INCLUDE_DIR})
 target_link_libraries(signd_core PUBLIC ${SIGND_ORT_LIBRARY})
@@ -132,5 +132,9 @@ add_test(NAME signs_tracker COMMAND signs_tracker_test)
 add_executable(road_users_test tools/road_users_test.cc)
 target_link_libraries(road_users_test PRIVATE signd_core)
 add_test(NAME road_users COMMAND road_users_test)
+# Road-user scale rate (image scale change by patch alignment): synthetic bias / uncertainty checks, no model
+add_executable(scale_rate_test tools/scale_rate_test.cc)
+target_link_libraries(scale_rate_test PRIVATE signd_core)
+add_test(NAME scale_rate COMMAND scale_rate_test)
 
 install(TARGETS signd signd_replay lights_replay RUNTIME DESTINATION bin)

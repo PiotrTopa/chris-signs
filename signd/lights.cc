@@ -9,6 +9,8 @@
 
 #include <unistd.h>
 
+#include "scale.h"
+
 namespace roadsense {
 namespace signs {
 
@@ -162,6 +164,13 @@ LightPipeline::LightPipeline(const LightsConfig &cfg) : cfg_(cfg) {
         cfg_.state = "rule";
     }
     ru_on_ = cfg_.road_users;
+    if (cfg_.road_users && cfg_.ru_scale) {
+        ScaleConfig sc;
+        sc.max_boxes = cfg_.ru_scale_max;
+        sc.min_dt_s = cfg_.ru_scale_dt[0], sc.max_dt_s = cfg_.ru_scale_dt[1];
+        sc.chain_max_gap_s = std::max(sc.chain_max_gap_s, sc.max_dt_s + 0.3);
+        scale_.reset(new ScaleRateEstimator(sc));
+    }
     if (cfg_.state != "rule") {
         RunnerOptions so;
         so.backend = "ort";
@@ -176,6 +185,20 @@ LightPipeline::LightPipeline(const LightsConfig &cfg) : cfg_(cfg) {
 }
 
 LightPipeline::~LightPipeline() = default;
+
+void LightPipeline::measure_scale(const Nv12View &f, int64_t ts_ns, LightsTiming *t) {
+    if (!scale_) return;
+    const auto t0 = Clock::now();
+    scale_->update(f, ts_ns, users_);
+    const double ms = ms_since(t0);
+    if (t) t->scale_ms = ms, t->total_ms += ms;
+}
+
+const uint64_t *LightPipeline::scale_why() const { return scale_ ? scale_->why() : nullptr; }
+
+void LightPipeline::reset_scale() {
+    if (scale_) scale_->reset();
+}
 
 void LightPipeline::classify(const Nv12View &f, LightDet &d) {
     const int bw = std::max(2, int(std::lround(d.x1 - d.x0))), bh = std::max(3, int(std::lround(d.y1 - d.y0)));
@@ -594,13 +617,18 @@ std::string lights_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, do
             if (d.clip & 4) clip[n++] = 'r';
             if (d.clip & 8) clip[n++] = 'b';
             clip[n] = 0;
+            // optional "scale_rate", "scale_rate_std" (1/s), "scale_dt_s" (s): image scale change (--lights-ru-scale)
+            char sr[96] = "";
+            if (d.scale_ok)
+                snprintf(sr, sizeof(sr), ",\"scale_rate\":%s,\"scale_rate_std\":%s,\"scale_dt_s\":%s", fmt(d.scale_rate, 4).c_str(),
+                         fmt(d.scale_rate_std, 4).c_str(), fmt(d.scale_dt_s, 3).c_str());
             snprintf(b, sizeof(b),
                      "%s{\"cls\":\"%s\",\"score\":%s,\"box\":[%s,%s,%s,%s],\"clip\":\"%s\",\"rider\":%s,"
-                     "\"p\":[%s,%s,%s,%s,%s,%s,%s,%s]}",
+                     "\"p\":[%s,%s,%s,%s,%s,%s,%s,%s]%s}",
                      i ? "," : "", road_user_name(d.cls), fmt(d.score, 3).c_str(), fmt(d.x0, 1).c_str(), fmt(d.y0, 1).c_str(),
                      fmt(d.x1, 1).c_str(), fmt(d.y1, 1).c_str(), clip, d.rider ? "true" : "false", fmt(d.p[0], 2).c_str(),
                      fmt(d.p[1], 2).c_str(), fmt(d.p[2], 2).c_str(), fmt(d.p[3], 2).c_str(), fmt(d.p[4], 2).c_str(),
-                     fmt(d.p[5], 2).c_str(), fmt(d.p[6], 2).c_str(), fmt(d.p[7], 2).c_str());
+                     fmt(d.p[5], 2).c_str(), fmt(d.p[6], 2).c_str(), fmt(d.p[7], 2).c_str(), sr);
             s += b;
         }
         s += "]";
@@ -610,6 +638,7 @@ std::string lights_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, do
                  fmt(tm->pre_ms, 2).c_str(), fmt(tm->det_ms, 2).c_str(), fmt(tm->post_ms, 2).c_str(),
                  fmt(tm->state_ms, 2).c_str(), fmt(tm->wait_ms, 2).c_str(), fmt(tm->users_ms, 3).c_str());
         s += b;
+        if (tm->scale_ms >= 0) s.insert(s.size() - 1, ",\"scale_ms\":" + fmt(tm->scale_ms, 3));
     }
     s += "}";
     return s;

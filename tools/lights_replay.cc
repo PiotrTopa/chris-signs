@@ -24,6 +24,7 @@
 #endif
 
 #include "lights.h"
+#include "scale.h"
 
 using namespace roadsense::signs;
 using Clock = std::chrono::steady_clock;
@@ -100,6 +101,10 @@ void usage() {
             "  --roi2 x0,y0,x1,y1  second view on every other processed frame (none)   --thr-keep X (off)   --coast N (0)\n"
             "  --dt-ms X  time between processed frames for the tracker (200)\n"
             "  --road-users  also decode the road users (signd --lights-road-users) into each message\n"
+            "  --ru-scale    with --road-users: image scale change per road user (signd --lights-ru-scale)\n"
+            "  --ru-scale-dt MIN,MAX  its baseline window in s (0.2,1.0)\n"
+            "  --name-fps F  frame time from the JPEG file name: <number>.jpg = frame number at F frames/s (recorder\n"
+            "                frames/<seq>.jpg, ride frames <index>.jpg at 20); default: --dt-ms per processed frame\n"
             "  --both     with --roi2: run both views on every frame (detections merged by NMS) instead of alternating\n"
             "  --idle P   while the tracker holds no track at all, the frames follow the pattern P instead of wide, zoom,\n"
             "             wide, ...: one letter per frame, W = wide view, Z = second view, . = no detector pass (signd\n"
@@ -132,7 +137,8 @@ int main(int argc, char **argv) {
     uint64_t view_phase = 0;  // 1: zoom, wide, zoom, ... (the other phase of the same schedule: a noise estimate)
     uint64_t max_frames = 0;
     bool track = true, both = false;
-    double dt_ms = 200;
+    double dt_ms = 200, name_fps = 0;
+    int64_t file_ts = -1;  // --name-fps: the current file's time
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto val = [&]() -> std::string {
@@ -152,6 +158,12 @@ int main(int argc, char **argv) {
         else if (a == "--thr-keep") lc.det_thr_keep = float(atof(val().c_str()));
         else if (a == "--coast") tc.report_coast = atoi(val().c_str());
         else if (a == "--dt-ms") dt_ms = atof(val().c_str());
+        else if (a == "--name-fps") name_fps = atof(val().c_str());
+        else if (a == "--ru-scale") lc.ru_scale = true;
+        else if (a == "--ru-scale-dt") {
+            lc.ru_scale = true;
+            if (!parse_floats(val(), lc.ru_scale_dt, 2)) return usage(), 2;
+        }
         else if (a == "--nms") lc.nms_iou = float(atof(val().c_str()));
         else if (a == "--state") lc.state = val();
         else if (a == "--threads") lc.threads = atoi(val().c_str());
@@ -204,7 +216,7 @@ int main(int argc, char **argv) {
     LightTracker tracker(tc);
     std::vector<LightDet> dets;
     std::vector<LightTrackReport> reps;
-    std::vector<double> t_pre, t_det, t_state, t_total, t_users;
+    std::vector<double> t_pre, t_det, t_state, t_total, t_users, t_scale;
     uint64_t seq = 0, passes = view_phase, idle_n = 0, skipped = 0;
     Nv12Image frame;
     auto run = [&](const Nv12View &v) {
@@ -229,6 +241,11 @@ int main(int argc, char **argv) {
         }
         ++passes;
         pipe->process(v, dets, &t, view);
+        const int64_t ts = file_ts >= 0 ? file_ts : int64_t(double(seq + 1) * dt_ms * 1e6);  // nominal 5 Hz unless --dt-ms
+        if (lc.road_users && lc.ru_scale) {
+            pipe->measure_scale(v, ts, &t);
+            t_scale.push_back(t.scale_ms);
+        }
         if (both && pipe->has_view2()) {  // second view on the same frame, merged by score-ordered NMS
             std::vector<LightDet> d2;
             LightsTiming t2;
@@ -250,7 +267,6 @@ int main(int argc, char **argv) {
             dets.swap(kept);
         }
         ++seq;
-        const int64_t ts = int64_t(double(seq) * dt_ms * 1e6);  // nominal 5 Hz for the tracker unless --dt-ms
         const float *vr = pipe->view_roi(view);
         const float seen[4] = {vr[0] * v.width, vr[1] * v.height, vr[2] * v.width, vr[3] * v.height};
         if (track) tracker.update(seq, ts, dets, reps, seen);
@@ -288,6 +304,10 @@ int main(int argc, char **argv) {
                     continue;
                 }
                 rgb_to_nv12(px.data(), w, h, frame);
+                if (name_fps > 0) {
+                    const size_t sl = path.find_last_of('/');
+                    file_ts = int64_t(atof(path.c_str() + (sl == std::string::npos ? 0 : sl + 1)) / name_fps * 1e9);
+                }
                 if (!track) tracker.reset();
                 run(frame.view());
 #else
@@ -308,6 +328,14 @@ int main(int argc, char **argv) {
     if (lc.road_users)
         fprintf(stderr, "lights_replay: road-user decode median/p90/max ms %.3f/%.3f/%.3f\n", median(t_users), pct(t_users, 0.9),
                 t_users.empty() ? 0.0 : *std::max_element(t_users.begin(), t_users.end()));
+    if (!t_scale.empty())
+        fprintf(stderr, "lights_replay: road-user scale rate median/p90/max ms %.3f/%.3f/%.3f\n", median(t_scale),
+                pct(t_scale, 0.9), *std::max_element(t_scale.begin(), t_scale.end()));
+    if (const uint64_t *w = pipe->scale_why()) {
+        fprintf(stderr, "lights_replay: road-user scale rate per box:");
+        for (int i = 0; i < kNumScaleWhy; ++i) fprintf(stderr, " %s %llu", scale_why_name(i), (unsigned long long)w[i]);
+        fprintf(stderr, "\n");
+    }
     if (bench > 0 && !frame.data.empty()) {
         std::vector<double> d;
         for (int i = 0; i < bench; ++i) {

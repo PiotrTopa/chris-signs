@@ -24,6 +24,8 @@
 namespace roadsense {
 namespace signs {
 
+class ScaleRateEstimator;
+
 enum LightState { kRed = 0, kYellow, kRedYellow, kGreen, kOff, kUnknown, kNumLightStates };
 const char *light_state_name(int s);
 
@@ -57,6 +59,11 @@ struct LightsConfig {
     // lower band gives them one. It costs one detector run each time: off by default, shed first.
     float ru_roi[4] = {0.f, 0.f, 0.f, 0.f};
     double ru_hz = 1.0;
+    // Image scale change per road user (signd --lights-ru-scale, signd/scale.h): `scale_rate` (d ln size / dt of
+    // the object's image, 1/s), `scale_rate_std`, `scale_dt_s` on the boxes that get a value. Needs road_users.
+    bool ru_scale = false;
+    int ru_scale_max = 12;  // boxes measured per pass (largest first)
+    float ru_scale_dt[2] = {0.2f, 1.0f};  // baseline window (s): the oldest patch of the object inside it is used
     float det_thr = 0.25f, nms_iou = 0.45f;
     // Boxes down to this score are kept for the tracker, which lets them continue an existing track but never
     // start one (0 = same as det_thr: every box may start a track, the behaviour before 2026-11-16).
@@ -91,11 +98,16 @@ struct RoadUserDet {
     int clip = 0;
     bool rider = false;
     float p[8];
+    // Image scale change (LightsConfig::ru_scale, signd/scale.h): d ln(size)/dt of the object's image over the
+    // baseline scale_dt_s (positive = growing = approaching), its 1-sigma; only when scale_ok.
+    bool scale_ok = false;
+    float scale_rate = 0.f, scale_rate_std = 0.f, scale_dt_s = 0.f;
 };
 const char *road_user_name(int cls);
 
 struct LightsTiming {
     double pre_ms = 0, det_ms = 0, post_ms = 0, state_ms = 0, total_ms = 0, wait_ms = 0, users_ms = 0;
+    double scale_ms = -1;  // measure_scale() of this pass (< 0: not run)
 };
 
 class LightPipeline {
@@ -124,6 +136,13 @@ public:
     // Decode road users in the next process() calls (the governor's `road_users_hz` pauses this); default on
     // when cfg.road_users.
     void set_road_users(bool on) { ru_on_ = on && cfg_.road_users; }
+    // Image scale change of the road users of the last process() call (cfg.ru_scale): fills their scale_* fields
+    // from the full-resolution luma of `frame` (the frame process() just saw) and keeps their patches for later
+    // passes. ts_ns: the frame's monotonic time. Adds its time to t->scale_ms and t->total_ms when given.
+    void measure_scale(const Nv12View &frame, int64_t ts_ns, LightsTiming *t = nullptr);
+    void reset_scale();
+    // boxes per ScaleWhy (signd/scale.h) since start, nullptr without cfg.ru_scale
+    const uint64_t *scale_why() const;
     bool road_users_on() const { return ru_on_; }
     // GPU schedule hooks, as SignPipeline::before_det / after_det.
     std::function<void()> before_det, after_det;
@@ -138,6 +157,7 @@ private:
     std::vector<LightDet> signs_;
     std::vector<RoadUserDet> users_;
     bool ru_on_ = false;
+    std::unique_ptr<ScaleRateEstimator> scale_;
 };
 
 // Pairs riders with the bike / motorbike box under them (in place): the vehicle keeps its class, gets the

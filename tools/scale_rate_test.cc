@@ -69,7 +69,16 @@ struct Case {
     bool uniform = false;  // textureless object
     double x_start = 600;  // object centre x at t = 0
     double jitter = 2.0;   // box edge jitter (px, 1 sigma)
+    // A vehicle in the dark: a dark body (luma about 25, faint texture), two lamps at +- 0.32 of the width (cores
+    // clipped, a halo whose width changes from frame to frame: blooming with the exposure), the exposure itself
+    // changing by +- 20 % per frame, horizontal motion blur of 0-3 px, red chroma on the lamps, noise `noise`.
+    bool night = false;
 };
+enum Mode { kPatch = 0, kMulti3, kLamps, kLampsOnly, kLampsMulti };
+const char *mode_name(int m) {
+    static const char *n[] = {"patch", "patch x3", "patch+lamps", "lamps only", "patch x3+lamps"};
+    return n[m];
+}
 
 struct Stats {
     int n = 0, measured = 0;
@@ -116,7 +125,50 @@ void render(const Case &c, const Tex &obj, const Tex &bg, double t, std::mt19937
     std::memset(img.data() + size_t(W) * H, 128, size_t(W) * H / 2);
 }
 
-Stats run_case(const Case &c, int trials, unsigned seed, bool verbose) {
+// The night scene (Case::night). Lamp: A exp(-d^2 / 2 s^2), s^2 = (0.05 w)^2 + bloom^2, A = 700 (clipped).
+void render_night(const Case &c, const Tex &obj, const Tex &bg, double t, std::mt19937 &rng, std::vector<uint8_t> &img,
+                  double box[4]) {
+    const double h = c.h0 * std::exp(c.rate * t), w = h * c.aspect;
+    const double cx = c.x_start + c.vx * t, cy = 380 + c.vy * t;
+    box[0] = cx - w / 2, box[1] = cy - h / 2, box[2] = cx + w / 2, box[3] = cy + h / 2;
+    std::normal_distribution<float> N(0, c.noise);
+    std::uniform_real_distribution<double> U(0, 1);
+    const double gain = 0.8 + 0.4 * U(rng), bloom = 0.6 + 1.2 * U(rng), blur = 3.0 * U(rng);
+    if (img.size() != size_t(W) * H * 3 / 2) {
+        img.resize(size_t(W) * H * 3 / 2);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) img[size_t(y) * W + x] = uint8_t(std::lround(0.4f * bg.at(x / 10.0, y / 10.0)));
+    }
+    std::memset(img.data() + size_t(W) * H, 128, size_t(W) * H / 2);
+    const double ls2 = (0.05 * w) * (0.05 * w) + bloom * bloom, ly = box[1] + 0.45 * h;
+    const double lx[2] = {cx - 0.32 * w, cx + 0.32 * w};
+    const int x0 = std::max(0, int(box[0]) - 40), x1 = std::min(W, int(box[2]) + 40);
+    const int y0 = std::max(0, int(box[1]) - 40), y1 = std::min(H, int(box[3]) + 40);
+    for (int y = y0; y < y1; ++y)
+        for (int x = x0; x < x1; ++x) {
+            double v = 0, lamp = 0;
+            for (int a = 0; a < 4; ++a)
+                for (int b = 0; b < 4; ++b)
+                    for (int m = 0; m < 3; ++m) {  // motion blur: three samples along x
+                        const double px = x + (b + 0.5) / 4 - 0.5 + (m - 1) * blur / 3, py = y + (a + 0.5) / 4 - 0.5;
+                        const double ox = (px - box[0]) / w, oy = (py - box[1]) / h;
+                        double q = (ox >= 0 && ox < 1 && oy >= 0 && oy < 1) ? 25.0 + 0.15 * (obj.at(ox * (obj.n - 1), oy * (obj.n - 1)) - 90.0)
+                                                                         : 0.4 * bg.at(px / 10.0, py / 10.0);
+                        double l = 0;
+                        for (double lxk : lx) l += 700.0 * std::exp(-((px - lxk) * (px - lxk) + (py - ly) * (py - ly)) / (2 * ls2));
+                        v += q + l, lamp += l;
+                    }
+            v = v / 48 * gain + N(rng), lamp = lamp / 48 * gain;
+            img[size_t(y) * W + x] = uint8_t(std::min(255.0, std::max(0.0, std::round(v))));
+            if (lamp > 8) {  // red halo: Cr up, Cb down, strongest where the luma is not clipped
+                uint8_t *uv = img.data() + size_t(W) * H + size_t(y / 2) * W + size_t(x / 2) * 2;
+                const double k = std::min(1.0, lamp / 60.0);
+                uv[0] = uint8_t(128 - 18 * k), uv[1] = uint8_t(128 + 45 * k);
+            }
+        }
+}
+
+Stats run_case(const Case &c, int trials, unsigned seed, bool verbose, int mode = kPatch) {
     Stats st;
     std::mt19937 rng(seed);
     std::normal_distribution<double> J(0, 1);
@@ -125,12 +177,16 @@ Stats run_case(const Case &c, int trials, unsigned seed, bool verbose) {
         const Tex obj = make_tex(rng, TX, 90, c.contrast, 40, 3, 14);
         const Tex bg = make_tex(rng, TX + 32, 40, 15, 60, 2, 8);
         ScaleConfig cfg;
+        cfg.baselines = (mode == kMulti3 || mode == kLampsMulti) ? 3 : 1;
+        cfg.lamps = mode >= kLamps;
+        cfg.patch = mode != kLampsOnly;
         ScaleRateEstimator est(cfg);
         img.clear();
         for (int k = 0; k <= 6; ++k) {
             const double t = 0.2 * k;
             double box[4];
-            render(c, obj, bg, t, rng, img, box);
+            if (c.night) render_night(c, obj, bg, t, rng, img, box);
+            else render(c, obj, bg, t, rng, img, box);
             Nv12View v;
             v.y = img.data(), v.uv = img.data() + size_t(W) * H, v.width = W, v.height = H, v.y_stride = v.uv_stride = W;
             RoadUserDet d;
@@ -140,6 +196,7 @@ Stats run_case(const Case &c, int trials, unsigned seed, bool verbose) {
             for (float &p : d.p) p = 0;
             std::vector<RoadUserDet> users = {d};
             const auto c0 = std::chrono::steady_clock::now();
+            if (cfg.lamps) ru_lamps(v, users[0], users[0].lamps);
             est.update(v, int64_t(t * 1e9), users);
             if (k >= 1) st.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count(), ++st.ms_n;
             if (k < 2) continue;  // baselines from 0.4 s on
@@ -184,6 +241,94 @@ int main(int argc, char **argv) {
         CHECK(std::fabs(m) < 0.01 + 3 * sd / std::sqrt(std::max(1, s.measured)));  // no bias beyond the noise
         CHECK(pull > 0.5 && pull < 1.6);                      // stated std matches the scatter within a factor
         CHECK(s.out3 <= s.measured / 50 + 1);                 // no heavy tail of confident wrong values
+    }
+    {   // more baselines, the lamp pair: by day (several baselines), in the dark (all modes)
+        const std::vector<Case> day = {cases[1], cases[2], cases[3]};
+        const std::vector<Case> night = {
+            {"night far 16 px, closing", 16, 1.25, 0.15, 20, 0, 40, 4, false, 600, 2.0, true},
+            {"night far 16 px, still", 16, 1.25, 0.0, 0, 0, 40, 4, false, 600, 2.0, true},
+            {"night mid 32 px, closing", 32, 1.25, 0.25, 30, 5, 40, 4, false, 600, 2.5, true},
+            {"night mid 32 px, opening", 32, 1.25, -0.20, -20, 0, 40, 4, false, 600, 2.5, true},
+            {"night near 90 px, closing", 90, 1.2, 0.35, 10, 10, 40, 4, false, 640, 3.0, true},
+        };
+        const auto row = [&](const Case &c, int mode, unsigned sd, bool check) {
+            const Stats s = run_case(c, 40, sd, false, mode);
+            const double m = s.measured ? s.se / s.measured : 0;
+            const double sdv = s.measured > 1 ? std::sqrt(std::max(0.0, s.se2 / s.measured - m * m)) : 0;
+            const double stated = s.measured ? s.sstd / s.measured : 0, pull = s.measured ? std::sqrt(s.sp2 / s.measured) : 0;
+            printf("%-26s %-15s %5d %7.0f%% %+8.4f %9.4f %9.4f %8.2f %5.1f%% %7.2f %7.3f\n", c.name, mode_name(mode), s.n,
+                   100.0 * s.measured / std::max(1, s.n), m, sdv, stated, pull, 100.0 * s.out3 / std::max(1, s.measured),
+                   s.measured ? s.sdt / s.measured : 0, s.ms / std::max(1, s.ms_n));
+            if (check) {
+                CHECK(std::fabs(m) < 0.01 + 3 * sdv / std::sqrt(std::max(1, s.measured)));
+                // the lamp pair's stated std is set by what real blobs do (signd/detin.cc), which these clean
+                // Gaussians do not: it may be far above the scatter here, never below it
+                CHECK(pull < 1.6 && (mode == kLampsOnly || pull > 0.5));
+                CHECK(s.out3 <= s.measured / 25 + 1);
+            }
+            return s;
+        };
+        printf("%-26s %-15s %5s %8s %8s %9s %9s %8s %6s %7s %7s\n", "case", "mode", "n", "coverage", "bias", "scatter", "stated", "pull", ">3sig", "dt", "ms/box");
+        unsigned sd = 200;
+        for (const Case &c : day) {
+            const Stats a = row(c, kPatch, sd, false);
+            const Stats b = row(c, kMulti3, sd, true);
+            CHECK(b.measured >= a.measured);  // more baselines never cost coverage
+            ++sd;
+        }
+        for (const Case &c : night) {
+            const Stats a = row(c, kPatch, sd, false);
+            row(c, kLampsOnly, sd, true);
+            const Stats b = row(c, kLamps, sd, false);
+            CHECK(b.measured >= a.measured);  // the lamp pair never costs coverage
+            ++sd;
+        }
+    }
+    {   // low-score boxes: they continue an object's chain and are measured; alone they start nothing
+        std::mt19937 rng(77);
+        const Case c = {"low list", 60, 1.2, 0.30, 40, 10, 40, 3};
+        const Tex obj = make_tex(rng, TX, 90, c.contrast, 40, 3, 14), bg = make_tex(rng, TX + 32, 40, 15, 60, 2, 8);
+        ScaleConfig cfg;
+        ScaleRateEstimator with(cfg), without(cfg);
+        std::vector<uint8_t> img;
+        bool low_measured = false, after_with = false, after_without = false;
+        double dt_with = 0, dt_without = 0;
+        for (int k = 0; k <= 4; ++k) {
+            const double t = 0.2 * k;
+            double b[4];
+            render(c, obj, bg, t, rng, img, b);
+            Nv12View v;
+            v.y = img.data(), v.uv = img.data() + size_t(W) * H, v.width = W, v.height = H, v.y_stride = v.uv_stride = W;
+            RoadUserDet d;
+            d.x0 = float(b[0]), d.y0 = float(b[1]), d.x1 = float(b[2]), d.y1 = float(b[3]), d.score = 0.8f, d.cls = 2;
+            for (float &p : d.p) p = 0;
+            // passes 1-3: the object only in the low list (for `with`), in no list (for `without`)
+            std::vector<RoadUserDet> hi, low, none;
+            if (k == 0 || k == 4) hi = {d};
+            else low = {d};
+            std::vector<RoadUserDet> hi2 = hi;
+            with.update(v, int64_t(t * 1e9), hi, &low);
+            without.update(v, int64_t(t * 1e9), hi2, &none);
+            if (k == 3) low_measured = low[0].scale_ok && std::fabs(low[0].scale_rate - c.rate) < 0.03;
+            if (k == 4) {
+                after_with = hi[0].scale_ok, dt_with = hi[0].scale_dt_s;
+                after_without = hi2[0].scale_ok, dt_without = hi2[0].scale_dt_s;
+            }
+        }
+        CHECK(low_measured);                       // a low box on a known object is measured
+        CHECK(after_with && dt_with > 0.75);       // the chain went on through the low boxes: baseline 0.8 s
+        CHECK(with.chains() == 1 && without.chains() == 1);
+        (void)after_without, (void)dt_without;     // (without the low list the chain is 0.8 s old too: within the gap)
+        // a low box where no object is known starts no chain
+        ScaleRateEstimator fresh(cfg);
+        RoadUserDet d;
+        d.x0 = 100, d.y0 = 100, d.x1 = 160, d.y1 = 150, d.score = 0.2f, d.cls = 2;
+        for (float &p : d.p) p = 0;
+        std::vector<RoadUserDet> hi, low = {d};
+        Nv12View v;
+        v.y = img.data(), v.uv = img.data() + size_t(W) * H, v.width = W, v.height = H, v.y_stride = v.uv_stride = W;
+        fresh.update(v, 0, hi, &low);
+        CHECK(fresh.chains() == 0 && !low[0].scale_ok);
     }
     {   // a textureless object: no value
         const Case c = {"uniform 60 px", 60, 1.2, 0.3, 20, 0, 0, 3, true};

@@ -45,13 +45,35 @@ struct ScaleConfig {
     float min_r2 = 0.6f;        // fit: 1 - residual variance / template variance
     float min_tex = 2.5f;       // template standard deviation, grey levels
     double max_std = 0.06;      // stated 1-sigma of the log scale change over the baseline: above it no value
+    // Several baselines (signd --lights-ru-scale-multi N; 1 = the oldest patch only, as before): the current frame is
+    // aligned with up to N earlier patches of the window (the oldest and others spread over it); the rate is the
+    // generalised least-squares slope of their log scale changes over their baselines, the errors taken as
+    // correlated by `multi_rho` (all share the current frame's noise). A baseline that disagrees with the others by
+    // more than `multi_out` sigma is left out; the stated std grows with the scatter the baselines show.
+    int baselines = 1;
+    double multi_rho = 0.5, multi_out = 3.5;
+    // Lamp pair (signd --lights-ru-scale-lamps; needs the lamp pairs of RoadUserDet::lamps, i.e. the view cues): the
+    // rate of ln(lamp separation) over the chain's passes of the window, a weighted line fit; its std from the
+    // centroids' stated errors, grown by the fit's own scatter. Combined with the patch value when both exist.
+    bool lamps = false;
+    bool patch = true;           // false: lamp pair only (evaluation of the lamp measurement by itself)
+    double lamp_jump = 0.25;     // a step of ln(separation) between two passes above this: another pair, series ends
+    double lamp_min_sep = 10.0;  // px: below, the pair picked flips between lamps and reflections (measured: 0.8 px)
+    int lamp_min_n = 3;          // passes with the pair in the window (the fit's own scatter needs a third point)
+    double lamp_huber = 1.5;     // the line fit down-weights a pass further than this many sigma from it
+    double lamp_max_std = 0.12;  // stated 1-sigma of the lamp rate (1/s) above which it is not used
+    double agree_sigma = 3.0;    // patch and lamp values further apart than this (in their combined sigma) disagree:
+                                 // the mean is given with half their difference added to its std
 };
 
 // Why a box got no value (or kMeasured), counted per box by ScaleRateEstimator::why().
 enum ScaleWhy {
     kMeasured = 0, kSmall, kTexture, kFrameEdge, kNcc, kSearchEdge, kFit, kRunaway, kNoConv, kR2, kStd,  // measure_scale()
-    kOverCap, kBoxEdge, kNew, kNoBaseline, kClipped, kNumScaleWhy                     // the estimator
+    kOverCap, kBoxEdge, kNew, kNoBaseline, kClipped,                                  // the estimator
+    kLampOnly, kNumScaleWhy  // measured by the lamp pair where the patch gave no value (counted beside the patch's reason)
 };
+// Where a box's value comes from (RoadUserDet::scale_src): patch alignment, the lamp pair, or both combined.
+enum ScaleSrc { kSrcNone = 0, kSrcPatch = 1, kSrcLamps = 2, kSrcBoth = 3 };
 const char *scale_why_name(int why);
 
 struct ScaleResult {
@@ -76,8 +98,9 @@ class ScaleRateEstimator {
 public:
     explicit ScaleRateEstimator(const ScaleConfig &cfg) : cfg_(cfg) {}
     // One pass: measures the boxes of `users` (frame pixels of `f`) in place (RoadUserDet::scale_*), stores
-    // their patches. ts_ns: the frame's monotonic time.
-    void update(const Nv12View &f, int64_t ts_ns, std::vector<RoadUserDet> &users);
+    // their patches. ts_ns: the frame's monotonic time. `low` (optional): the low-score boxes; they continue the
+    // chain of an object the first list missed in this pass (and are measured), and never start a chain.
+    void update(const Nv12View &f, int64_t ts_ns, std::vector<RoadUserDet> &users, std::vector<RoadUserDet> *low = nullptr);
     void reset() { chains_.clear(); }
     size_t chains() const { return chains_.size(); }
     const ScaleConfig &config() const { return cfg_; }
@@ -92,6 +115,9 @@ private:
         int w, h;
         bool edge;         // box touches the frame edge (no template)
         int clip;          // RoadUserDet::clip (edges of the view's region the box touches)
+        bool lamp = false; // the box had a lamp pair
+        float lsep = 0, lsep_std = 0;
+        int lcol = 0;
         std::vector<float> tpl;
     };
     struct Chain {

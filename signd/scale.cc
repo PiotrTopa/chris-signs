@@ -286,12 +286,14 @@ ScaleResult measure_scale(const std::vector<float> &tpl, int tw, int th, double 
 
 const char *scale_why_name(int why) {
     static const char *n[kNumScaleWhy] = {"measured", "tiny", "textureless", "frame_edge", "ncc", "search_edge", "fit", "runaway", "no_convergence",
-                                          "r2", "std", "over_cap", "box_at_edge", "new_object", "no_baseline", "clipped"};
+                                          "r2", "std", "over_cap", "box_at_edge", "new_object", "no_baseline", "clipped", "lamps_only"};
     return why >= 0 && why < kNumScaleWhy ? n[why] : "?";
 }
 
-void ScaleRateEstimator::update(const Nv12View &f, int64_t ts, std::vector<RoadUserDet> &users) {
-    for (RoadUserDet &u : users) u.scale_ok = false, u.scale_rate = u.scale_rate_std = u.scale_dt_s = 0.f;
+void ScaleRateEstimator::update(const Nv12View &f, int64_t ts, std::vector<RoadUserDet> &users, std::vector<RoadUserDet> *low) {
+    for (RoadUserDet &u : users) u.scale_ok = false, u.scale_rate = u.scale_rate_std = u.scale_dt_s = 0.f, u.scale_src = kSrcNone;
+    if (low)
+        for (RoadUserDet &u : *low) u.scale_ok = false, u.scale_rate = u.scale_rate_std = u.scale_dt_s = 0.f, u.scale_src = kSrcNone;
     if (ts < last_ts_) chains_.clear();  // time went backwards (new ring / replay restart)
     last_ts_ = ts;
     const int64_t gap = int64_t(cfg_.chain_max_gap_s * 1e9), keep = int64_t((cfg_.max_dt_s + 0.3) * 1e9);
@@ -304,59 +306,73 @@ void ScaleRateEstimator::update(const Nv12View &f, int64_t ts, std::vector<RoadU
         }
         chains_.swap(live);
     }
-    // the boxes measured: largest first
-    std::vector<size_t> idx;
-    for (size_t i = 0; i < users.size(); ++i)
-        if (users[i].x1 > users[i].x0 && users[i].y1 > users[i].y0) idx.push_back(i);
-    std::stable_sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
-        return (users[a].x1 - users[a].x0) * (users[a].y1 - users[a].y0) > (users[b].x1 - users[b].x0) * (users[b].y1 - users[b].y0);
-    });
-    if (int(idx.size()) > cfg_.max_boxes) why_[kOverCap] += idx.size() - size_t(cfg_.max_boxes), idx.resize(size_t(cfg_.max_boxes));
-
-    // association: each box to the chain whose predicted box overlaps it best
-    struct P { float s; size_t b, c; };
-    std::vector<P> pairs;
-    for (size_t bi = 0; bi < idx.size(); ++bi) {
-        const RoadUserDet &u = users[idx[bi]];
-        const float ub[4] = {u.x0, u.y0, u.x1, u.y1};
-        for (size_t ci = 0; ci < chains_.size(); ++ci) {
-            const Chain &c = chains_[ci];
-            if (c.grp != group_of(u.cls)) continue;
-            const Entry &n = c.e.back();
-            double vx = 0, vy = 0, vs = 0;
-            for (size_t j = c.e.size() - 1; j-- > 0;) {  // velocity from the newest entry at least 0.15 s older
-                const Entry &o = c.e[j];
-                const double dt = double(n.ts - o.ts) * 1e-9;
-                if (dt < 0.15) continue;
-                vx = ((n.box[0] + n.box[2]) - (o.box[0] + o.box[2])) * 0.5 / dt;
-                vy = ((n.box[1] + n.box[3]) - (o.box[1] + o.box[3])) * 0.5 / dt;
-                vs = std::log(std::max(1e-3, double(n.box[2] - n.box[0]) * (n.box[3] - n.box[1]) /
-                                                std::max(1e-3, double(o.box[2] - o.box[0]) * (o.box[3] - o.box[1])))) * 0.5 / dt;
-                vs = std::max(-2.0, std::min(2.0, vs));
-                break;
-            }
-            const double dt = double(ts - n.ts) * 1e-9, g = std::exp(vs * dt);
-            const double cx = (n.box[0] + n.box[2]) * 0.5 + vx * dt, cy = (n.box[1] + n.box[3]) * 0.5 + vy * dt;
-            const double w = (n.box[2] - n.box[0]) * 0.5 * g, h = (n.box[3] - n.box[1]) * 0.5 * g;
-            const float pb[4] = {float(cx - w), float(cy - h), float(cx + w), float(cy + h)};
-            const float s = iou_box(ub, pb);
-            if (s >= cfg_.match_iou) pairs.push_back({s, bi, ci});
-        }
+    // the boxes measured: largest first; then the low-score boxes (largest first) while the cap has room
+    std::vector<RoadUserDet *> bx;
+    const auto by_area = [](const RoadUserDet *a, const RoadUserDet *b) {
+        return (a->x1 - a->x0) * (a->y1 - a->y0) > (b->x1 - b->x0) * (b->y1 - b->y0);
+    };
+    for (RoadUserDet &u : users)
+        if (u.x1 > u.x0 && u.y1 > u.y0) bx.push_back(&u);
+    std::stable_sort(bx.begin(), bx.end(), by_area);
+    if (int(bx.size()) > cfg_.max_boxes) why_[kOverCap] += bx.size() - size_t(cfg_.max_boxes), bx.resize(size_t(cfg_.max_boxes));
+    const size_t n_high = bx.size();
+    if (low) {
+        for (RoadUserDet &u : *low)
+            if (u.x1 > u.x0 && u.y1 > u.y0) bx.push_back(&u);
+        std::stable_sort(bx.begin() + long(n_high), bx.end(), by_area);
+        if (int(bx.size()) > cfg_.max_boxes) bx.resize(size_t(cfg_.max_boxes));
     }
-    std::sort(pairs.begin(), pairs.end(), [](const P &a, const P &b) { return a.s > b.s; });
-    std::vector<int> match(idx.size(), -1);
-    std::vector<char> used(chains_.size(), 0);
-    for (const P &p : pairs)
-        if (match[p.b] < 0 && !used[p.c]) match[p.b] = int(p.c), used[p.c] = 1;
 
-    for (size_t bi = 0; bi < idx.size(); ++bi) {
-        RoadUserDet &u = users[idx[bi]];
+    // association: each box to the chain whose predicted box overlaps it best; the first list's boxes first, then
+    // the low-score boxes among the chains still free
+    struct P { float s; size_t b, c; };
+    std::vector<int> match(bx.size(), -1);
+    std::vector<char> used(chains_.size(), 0);
+    for (int stage = 0; stage < 2; ++stage) {
+        std::vector<P> pairs;
+        for (size_t bi = stage ? n_high : 0; bi < (stage ? bx.size() : n_high); ++bi) {
+            const RoadUserDet &u = *bx[bi];
+            const float ub[4] = {u.x0, u.y0, u.x1, u.y1};
+            for (size_t ci = 0; ci < chains_.size(); ++ci) {
+                const Chain &c = chains_[ci];
+                if (used[ci] || c.grp != group_of(u.cls)) continue;
+                const Entry &n = c.e.back();
+                double vx = 0, vy = 0, vs = 0;
+                for (size_t j = c.e.size() - 1; j-- > 0;) {  // velocity from the newest entry at least 0.15 s older
+                    const Entry &o = c.e[j];
+                    const double dt = double(n.ts - o.ts) * 1e-9;
+                    if (dt < 0.15) continue;
+                    vx = ((n.box[0] + n.box[2]) - (o.box[0] + o.box[2])) * 0.5 / dt;
+                    vy = ((n.box[1] + n.box[3]) - (o.box[1] + o.box[3])) * 0.5 / dt;
+                    vs = std::log(std::max(1e-3, double(n.box[2] - n.box[0]) * (n.box[3] - n.box[1]) /
+                                                    std::max(1e-3, double(o.box[2] - o.box[0]) * (o.box[3] - o.box[1])))) * 0.5 / dt;
+                    vs = std::max(-2.0, std::min(2.0, vs));
+                    break;
+                }
+                const double dt = double(ts - n.ts) * 1e-9, g = std::exp(vs * dt);
+                const double cx = (n.box[0] + n.box[2]) * 0.5 + vx * dt, cy = (n.box[1] + n.box[3]) * 0.5 + vy * dt;
+                const double w = (n.box[2] - n.box[0]) * 0.5 * g, h = (n.box[3] - n.box[1]) * 0.5 * g;
+                const float pb[4] = {float(cx - w), float(cy - h), float(cx + w), float(cy + h)};
+                const float s = iou_box(ub, pb);
+                if (s >= cfg_.match_iou) pairs.push_back({s, bi, ci});
+            }
+        }
+        std::sort(pairs.begin(), pairs.end(), [](const P &a, const P &b) { return a.s > b.s; });
+        for (const P &p : pairs)
+            if (match[p.b] < 0 && !used[p.c]) match[p.b] = int(p.c), used[p.c] = 1;
+    }
+
+    for (size_t bi = 0; bi < bx.size(); ++bi) {
+        RoadUserDet &u = *bx[bi];
+        const bool is_low = bi >= n_high;
+        if (is_low && match[bi] < 0) continue;  // a low-score box never starts a chain
         Entry e;
         e.ts = ts;
         e.box[0] = u.x0, e.box[1] = u.y0, e.box[2] = u.x1, e.box[3] = u.y1;
         e.cx = (u.x0 + u.x1) * 0.5, e.cy = (u.y0 + u.y1) * 0.5;
         e.edge = u.x0 <= 1.f || u.y0 <= 1.f || u.x1 >= f.width - 1.f || u.y1 >= f.height - 1.f;
         e.clip = u.clip;
+        if (cfg_.lamps && u.lamps.ok) e.lamp = true, e.lsep = u.lamps.sep, e.lsep_std = u.lamps.sep_std, e.lcol = u.lamps.colour;
         const double iw = (u.x1 - u.x0) * cfg_.inner_frac, ih = (u.y1 - u.y0) * cfg_.inner_frac;
         // about patch_px^2 template pixels whatever the aspect (a fixed long side would leave a flat box, e.g. a near
         // car cut by the view's edge, two rows high and its vertical shift undetermined); the long side may grow to
@@ -373,53 +389,180 @@ void ScaleRateEstimator::update(const Nv12View &f, int64_t ts, std::vector<RoadU
             if (!sample_luma(f, e.cx, e.cy, e.k, e.w, e.h, e.tpl)) e.tpl.clear();
         }
         int why = match[bi] < 0 ? kNew : e.edge ? kBoxEdge : kNoBaseline;
-        if (match[bi] >= 0 && !e.edge) {
+        // ---- patch alignment against one earlier patch of the chain
+        const auto align = [&](const Entry *t, int *why_out) {
+            ScaleResult r;
+            const double w0 = t->box[2] - t->box[0], h0 = t->box[3] - t->box[1], w1 = u.x1 - u.x0, h1 = u.y1 - u.y0;
+            const int cl = t->clip | u.clip;
+            const bool hx_ok = !(cl & (1 | 4)), hy_ok = !(cl & (2 | 8));
+            double prior = 0;
+            bool ok = true;
+            if (hx_ok && hy_ok) prior = 0.5 * (std::log(w1 / w0) + std::log(h1 / h0));
+            else if (hx_ok) prior = std::log(w1 / w0);
+            else if (hy_ok) prior = std::log(h1 / h0);
+            else ok = false;
+            // predicted position of the template centre: box centre, or anchored on the free edge of a clipped axis
+            const double sp = std::exp(prior);
+            double pcx = e.cx, pcy = e.cy;
+            if ((cl & 1) && (cl & 4)) ok = false;
+            else if (cl & 1) pcx = u.x1 - sp * (t->box[2] - t->cx);
+            else if (cl & 4) pcx = u.x0 + sp * (t->cx - t->box[0]);
+            if ((cl & 2) && (cl & 8)) ok = false;
+            else if (cl & 2) pcy = u.y1 - sp * (t->box[3] - t->cy);
+            else if (cl & 8) pcy = u.y0 + sp * (t->cy - t->box[1]);
+            if (!ok) return *why_out = kClipped, r;
+            // search ranges from the box jitter: edges ~1.5 px + 3 % of the size each, in both frames
+            const double side = std::sqrt(std::min(w0, w1) * std::min(h0, h1));
+            const double sig_ln = (2.0 * (1.5 + 0.03 * side) / side) / ((hx_ok && hy_ok) ? std::sqrt(2.0) : 1.0);
+            const double half = std::min(0.28, std::max(0.08, 3.0 * sig_ln));
+            const double k1 = t->k >= 0.999 ? 1.0 : std::min(0.66, t->k * std::exp(-prior));  // as measure_scale()
+            const double sig_c = 1.5 + 0.03 * std::max(w1, h1);
+            const int R = std::min(6, std::max(2, int(std::ceil(3.0 * sig_c * k1))));
+            r = measure_scale(t->tpl, t->w, t->h, t->k, f, prior, pcx, pcy, half, R, cfg_);
+            r.dt_s = double(ts - t->ts) * 1e-9;
+            *why_out = r.why;
+            return r;
+        };
+        bool p_ok = false;
+        double p_rate = 0, p_std = 0, p_dt = 0;
+        if (match[bi] >= 0 && !e.edge && cfg_.patch) {
             const Chain &c = chains_[size_t(match[bi])];
-            const Entry *t = nullptr;
-            for (const Entry &o : c.e) {  // oldest usable entry in the baseline window
+            std::vector<const Entry *> tp;  // usable entries in the baseline window, oldest first
+            for (const Entry &o : c.e) {
                 const double dt = double(ts - o.ts) * 1e-9;
                 if (dt > cfg_.max_dt_s || dt < cfg_.min_dt_s || o.tpl.empty() || o.edge) continue;
-                t = &o;
-                break;
+                tp.push_back(&o);
             }
-            if (t) {
-                const double w0 = t->box[2] - t->box[0], h0 = t->box[3] - t->box[1], w1 = u.x1 - u.x0, h1 = u.y1 - u.y0;
-                const int cl = t->clip | u.clip;
-                const bool hx_ok = !(cl & (1 | 4)), hy_ok = !(cl & (2 | 8));
-                double prior = 0;
-                bool ok = true;
-                if (hx_ok && hy_ok) prior = 0.5 * (std::log(w1 / w0) + std::log(h1 / h0));
-                else if (hx_ok) prior = std::log(w1 / w0);
-                else if (hy_ok) prior = std::log(h1 / h0);
-                else ok = false, why = kClipped;
-                // predicted position of the template centre: box centre, or anchored on the free edge of a clipped axis
-                const double sp = std::exp(prior);
-                double pcx = e.cx, pcy = e.cy;
-                if ((cl & 1) && (cl & 4)) ok = false, why = kClipped;
-                else if (cl & 1) pcx = u.x1 - sp * (t->box[2] - t->cx);
-                else if (cl & 4) pcx = u.x0 + sp * (t->cx - t->box[0]);
-                if ((cl & 2) && (cl & 8)) ok = false, why = kClipped;
-                else if (cl & 2) pcy = u.y1 - sp * (t->box[3] - t->cy);
-                else if (cl & 8) pcy = u.y0 + sp * (t->cy - t->box[1]);
-                if (ok) {
-                    // search ranges from the box jitter: edges ~1.5 px + 3 % of the size each, in both frames
-                    const double side = std::sqrt(std::min(w0, w1) * std::min(h0, h1));
-                    const double sig_ln = (2.0 * (1.5 + 0.03 * side) / side) / ((hx_ok && hy_ok) ? std::sqrt(2.0) : 1.0);
-                    const double half = std::min(0.28, std::max(0.08, 3.0 * sig_ln));
-                    const double k1 = t->k >= 0.999 ? 1.0 : std::min(0.66, t->k * std::exp(-prior));  // as measure_scale()
-                    const double sig_c = 1.5 + 0.03 * std::max(w1, h1);
-                    const int R = std::min(6, std::max(2, int(std::ceil(3.0 * sig_c * k1))));
-                    const ScaleResult r = measure_scale(t->tpl, t->w, t->h, t->k, f, prior, pcx, pcy, half, R, cfg_);
-                    why = r.why;
-                    if (r.ok) {
-                        const double dt = double(ts - t->ts) * 1e-9;
-                        u.scale_ok = true;
-                        u.scale_rate = float(r.ln_s / dt);
-                        u.scale_rate_std = float(r.ln_s_std / dt);
-                        u.scale_dt_s = float(dt);
+            if (!tp.empty()) {
+                const ScaleResult r0 = align(tp[0], &why);
+                if (cfg_.baselines <= 1 || tp.size() == 1) {
+                    if (r0.ok) p_ok = true, p_rate = r0.ln_s / r0.dt_s, p_std = r0.ln_s_std / r0.dt_s, p_dt = r0.dt_s;
+                } else {
+                    // the oldest and up to baselines - 1 others, spread over the window
+                    std::vector<ScaleResult> rs;
+                    if (r0.ok) rs.push_back(r0);
+                    const int extra = std::min(cfg_.baselines - 1, int(tp.size()) - 1);
+                    for (int k = 1; k <= extra; ++k) {
+                        const size_t j = size_t(std::lround(double(k) * double(tp.size() - 1) / double(extra)));
+                        int w2;
+                        const ScaleResult r = align(tp[j], &w2);
+                        if (r.ok) rs.push_back(r);
                     }
+                    // generalised least squares of ln_s_i = rate * dt_i, cov(i, j) = rho * std_i * std_j (i != j)
+                    const auto gls = [&](const std::vector<ScaleResult> &v, double *rate, double *var, double *chi2, size_t *worst) {
+                        const size_t n = v.size();
+                        std::vector<double> C(n * n), x(n), y(n);
+                        const auto solve_c = [&](std::vector<double> rhs) {
+                            std::vector<double> A(C);
+                            if (!solve(A.data(), rhs.data(), int(n))) rhs.assign(n, 0.0);
+                            return rhs;
+                        };
+                        for (size_t i = 0; i < n; ++i)
+                            for (size_t j = 0; j < n; ++j) C[i * n + j] = (i == j ? 1.0 : cfg_.multi_rho) * v[i].ln_s_std * v[j].ln_s_std;
+                        for (size_t i = 0; i < n; ++i) x[i] = v[i].dt_s, y[i] = v[i].ln_s;
+                        const std::vector<double> cx = solve_c(x);
+                        double xcx = 0, xcy = 0;
+                        for (size_t i = 0; i < n; ++i) xcx += x[i] * cx[i], xcy += y[i] * cx[i];
+                        if (!(xcx > 0)) return false;
+                        *rate = xcy / xcx, *var = 1.0 / xcx;
+                        std::vector<double> res(n);
+                        for (size_t i = 0; i < n; ++i) res[i] = y[i] - *rate * x[i];
+                        const std::vector<double> cr = solve_c(res);
+                        *chi2 = 0, *worst = 0;
+                        double wz = -1;
+                        for (size_t i = 0; i < n; ++i) {
+                            *chi2 += res[i] * cr[i];
+                            const double z = std::fabs(res[i]) / v[i].ln_s_std;
+                            if (z > wz) wz = z, *worst = i;
+                        }
+                        return true;
+                    };
+                    double rate = 0, var = 0, chi2 = 0;
+                    size_t worst = 0;
+                    if (rs.size() >= 3 && gls(rs, &rate, &var, &chi2, &worst) &&
+                        std::fabs(rs[worst].ln_s - rate * rs[worst].dt_s) > cfg_.multi_out * rs[worst].ln_s_std)
+                        rs.erase(rs.begin() + long(worst));  // one baseline against the others: left out
+                    if (rs.size() == 1) {
+                        p_ok = true, p_rate = rs[0].ln_s / rs[0].dt_s, p_std = rs[0].ln_s_std / rs[0].dt_s, p_dt = rs[0].dt_s;
+                    } else if (rs.size() >= 2 && gls(rs, &rate, &var, &chi2, &worst)) {
+                        const double infl = std::max(1.0, chi2 / double(rs.size() - 1));
+                        p_ok = true, p_rate = rate, p_std = std::sqrt(var * infl);
+                        for (const ScaleResult &r : rs) p_dt = std::max(p_dt, r.dt_s);
+                    }
+                    if (p_ok) why = kMeasured;
                 }
             }
+        }
+        // ---- lamp pair: weighted line through ln(separation) over the chain's passes of the window
+        bool l_ok = false;
+        double l_rate = 0, l_std = 0, l_dt = 0;
+        if (cfg_.lamps && e.lamp && e.lsep >= cfg_.lamp_min_sep && match[bi] >= 0) {
+            const Chain &c = chains_[size_t(match[bi])];
+            std::vector<double> t{0.0}, y{std::log(double(e.lsep))}, sg{double(e.lsep_std) / e.lsep};
+            double last = y[0];
+            for (size_t j = c.e.size(); j-- > 0;) {
+                const Entry &o = c.e[j];
+                const double dt = double(ts - o.ts) * 1e-9;
+                if (dt > cfg_.max_dt_s) break;
+                if (!o.lamp || o.lsep < cfg_.lamp_min_sep) continue;
+                const double v = std::log(double(o.lsep));
+                if (std::fabs(v - last) > cfg_.lamp_jump || (o.lcol && e.lcol && o.lcol != e.lcol)) break;  // another pair
+                t.push_back(-dt), y.push_back(v), sg.push_back(double(o.lsep_std) / o.lsep), last = v;
+            }
+            const size_t n = t.size();
+            if (int(n) >= cfg_.lamp_min_n && -t.back() >= cfg_.min_dt_s) {
+                // weighted line, Huber weights re-estimated three times (a pass on another pair of blobs, a lamp
+                // coming on: one point off the line must not turn it)
+                std::vector<double> hw(n, 1.0);
+                double slope = 0, icpt = 0, den = 0, sw = 0;
+                bool ok = true;
+                for (int it = 0; it < 4 && ok; ++it) {
+                    double st = 0, sy = 0, stt = 0, sty = 0;
+                    sw = 0;
+                    for (size_t i = 0; i < n; ++i) {
+                        const double w = hw[i] / (sg[i] * sg[i]);
+                        sw += w, st += w * t[i], sy += w * y[i], stt += w * t[i] * t[i], sty += w * t[i] * y[i];
+                    }
+                    den = sw * stt - st * st;
+                    if (!(den > 1e-12)) {
+                        ok = false;
+                        break;
+                    }
+                    slope = (sw * sty - st * sy) / den, icpt = (sy - slope * st) / sw;
+                    for (size_t i = 0; i < n; ++i) {
+                        const double z = std::fabs(y[i] - icpt - slope * t[i]) / sg[i];
+                        hw[i] = z <= cfg_.lamp_huber ? 1.0 : cfg_.lamp_huber / z;
+                    }
+                }
+                if (ok) {
+                    // the fit's own scatter (all points at full weight) grows the stated std, never shrinks it
+                    double chi2 = 0;
+                    for (size_t i = 0; i < n; ++i) {
+                        const double r = (y[i] - icpt - slope * t[i]) / sg[i];
+                        chi2 += r * r;
+                    }
+                    const double infl = std::max(1.0, chi2 / double(n - 2));
+                    l_rate = slope, l_std = std::sqrt(sw / den * infl), l_dt = -t.back();
+                    l_ok = l_std <= cfg_.lamp_max_std;
+                }
+            }
+        }
+        if (p_ok && l_ok) {
+            // both: inverse-variance mean; the two share pixels (the lamps lie in the patch), so its std is not taken
+            // below 0.7 of the better one's; where they disagree, half the difference is added
+            const double wp = 1.0 / (p_std * p_std), wl = 1.0 / (l_std * l_std), d = p_rate - l_rate;
+            double sd = std::max(std::sqrt(1.0 / (wp + wl)), 0.7 * std::min(p_std, l_std));
+            if (std::fabs(d) > cfg_.agree_sigma * std::hypot(p_std, l_std)) sd = std::hypot(sd, 0.5 * d);
+            u.scale_ok = true, u.scale_src = kSrcBoth;
+            u.scale_rate = float((wp * p_rate + wl * l_rate) / (wp + wl)), u.scale_rate_std = float(sd);
+            u.scale_dt_s = float((wp * p_dt + wl * l_dt) / (wp + wl));
+        } else if (p_ok) {
+            u.scale_ok = true, u.scale_src = kSrcPatch;
+            u.scale_rate = float(p_rate), u.scale_rate_std = float(p_std), u.scale_dt_s = float(p_dt);
+        } else if (l_ok) {
+            u.scale_ok = true, u.scale_src = kSrcLamps;
+            u.scale_rate = float(l_rate), u.scale_rate_std = float(l_std), u.scale_dt_s = float(l_dt);
+            ++why_[kLampOnly];
         }
         ++why_[why];
         if (match[bi] >= 0) {

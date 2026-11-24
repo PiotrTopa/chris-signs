@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "detin.h"
 #include "runner.h"
 #include "yolo.h"
 
@@ -64,6 +65,30 @@ struct LightsConfig {
     bool ru_scale = false;
     int ru_scale_max = 12;  // boxes measured per pass (largest first)
     float ru_scale_dt[2] = {0.2f, 1.0f};  // baseline window (s): the oldest patch of the object inside it is used
+    // Refinements of the scale rate (signd/scale.h), off by default: ru_scale_multi > 1 = that many baselines per
+    // box (--lights-ru-scale-multi N); ru_scale_lamps = the lamp pair's separation as a second measurement in the
+    // dark (--lights-ru-scale-lamps; switches the lamp search of ru_view on for the estimator even when the view
+    // cues are not published). With ru_thr_low the low-score boxes continue an object's chain.
+    int ru_scale_multi = 1;
+    bool ru_scale_lamps = false;
+    bool ru_scale_patch = true;  // false: lamp pair only (evaluation)
+    // Detection inputs for a tracker (signd/detin.h, docs/DETECTION_INPUTS.md); all off by default, each adds only
+    // optional keys. They need road_users.
+    //   ru_thr_low > 0 (signd --lights-ru-low X): boxes scoring above X but not above their class threshold are
+    //     listed too, in a list of their own (`road_users_low`): a tracker offers them to existing tracks only and
+    //     never starts one from them. A low box that overlaps a listed road user by more than ru_nms is dropped.
+    //   ru_flags (--lights-ru-flags): `trunc`, `occ`, `occ_by`, `occ_edges` per box.
+    //   ru_view (--lights-ru-view): view cues of vehicles from the box's own pixels, no model: `sym` (mirror
+    //     symmetry), `lamps` (the lamp pair of a vehicle in the dark: centroids, separation, colour).
+    //   ru_emb (--lights-ru-emb yuv | PATH.onnx): an appearance vector per box (`emb`, hex of int8) and the message
+    //     key `emb_kind`: "yuv" = the model-free yuv3x3 vector; a file = the learnt 32-number embedding (ORT, one
+    //     run per box, at most ru_emb_max boxes a pass, largest first; the others carry none).
+    std::string ru_emb;
+    int ru_emb_max = 16;
+    float ru_thr_low = 0.f;
+    int ru_low_max = 20;
+    bool ru_flags = false;
+    bool ru_view = false;
     float det_thr = 0.25f, nms_iou = 0.45f;
     // Boxes down to this score are kept for the tracker, which lets them continue an existing track but never
     // start one (0 = same as det_thr: every box may start a track, the behaviour before 2026-11-16).
@@ -102,12 +127,27 @@ struct RoadUserDet {
     // baseline scale_dt_s (positive = growing = approaching), its 1-sigma; only when scale_ok.
     bool scale_ok = false;
     float scale_rate = 0.f, scale_rate_std = 0.f, scale_dt_s = 0.f;
+    int scale_src = 0;  // ScaleSrc (signd/scale.h): 1 patch alignment, 2 lamp pair, 3 both; reported only with the lamps on
+    // Flags (LightsConfig::ru_flags, signd/detin.h), valid when `flags`: trunc = frame edges that cut the box (bits
+    // as clip); occ = share of the box covered by nearer boxes of the same message (0..1), occ_by = index of the
+    // one that covers most (-1: none), occ_edges = edges of this box hidden by them (bits as clip).
+    bool flags = false;
+    int trunc = 0;
+    float occ = 0.f;
+    int occ_by = -1, occ_edges = 0;
+    // View cues (LightsConfig::ru_view), valid when `view`: sym = mirror symmetry of the box's luma (-1..1; < -1:
+    // not measured), lamps = the lamp pair (lamps.ok).
+    bool view = false;
+    float sym = -2.f;
+    LampPair lamps;
+    Appearance emb;  // LightsConfig::ru_emb; emb.n = 0: none
 };
 const char *road_user_name(int cls);
 
 struct LightsTiming {
     double pre_ms = 0, det_ms = 0, post_ms = 0, state_ms = 0, total_ms = 0, wait_ms = 0, users_ms = 0;
     double scale_ms = -1;  // measure_scale() of this pass (< 0: not run)
+    double flags_ms = 0, view_ms = 0, emb_ms = 0;  // parts of users_ms (detection inputs, signd/detin.h)
 };
 
 class LightPipeline {
@@ -128,11 +168,16 @@ public:
     const LightsConfig &config() const { return cfg_; }
     const char *backend() const { return det_->name(); }
     bool has_state_cnn() const { return bool(st_); }
+    // "" (off), "yuv3x3" or "reid32": the kind of the road users' appearance vectors (message key `emb_kind`)
+    const char *emb_kind() const { return cfg_.ru_emb.empty() ? "" : emb_ ? "reid32" : "yuv3x3"; }
     // The sign proposals of the last process() call (empty unless cfg.sign_cls >= 0), frame pixels, NMS'd.
     const std::vector<LightDet> &sign_boxes() const { return signs_; }
     // The road users of the last process() call (empty unless cfg.road_users and process() was asked to decode
     // them), frame pixels, NMS'd, riders paired.
     const std::vector<RoadUserDet> &road_users() const { return users_; }
+    // The low-score road users of the last process() call (cfg.ru_thr_low > 0): boxes below their class threshold
+    // that no listed road user suppresses; for a tracker's second association stage only.
+    const std::vector<RoadUserDet> &road_users_low() const { return users_low_; }
     // Decode road users in the next process() calls (the governor's `road_users_hz` pauses this); default on
     // when cfg.road_users.
     void set_road_users(bool on) { ru_on_ = on && cfg_.road_users; }
@@ -150,12 +195,14 @@ public:
 private:
     void classify(const Nv12View &f, LightDet &d);
     LightsConfig cfg_;
-    std::unique_ptr<ModelRunner> det_, st_;
+    std::unique_ptr<ModelRunner> det_, st_, emb_;
+    std::vector<float> emb_in_, emb_out_;
+    void embed(const Nv12View &f);
     int n_anchor_ = 0, lb_w_ = -1, lb_h_ = -1;
     std::vector<float> in_, out_, st_in_, st_out_;
     std::vector<float> rgb_;
     std::vector<LightDet> signs_;
-    std::vector<RoadUserDet> users_;
+    std::vector<RoadUserDet> users_, users_low_;
     bool ru_on_ = false;
     std::unique_ptr<ScaleRateEstimator> scale_;
 };
@@ -237,15 +284,21 @@ private:
 
 // The road-user view's message (view 2): {"type":"road_users","seq","ts_mono_ns","ts_real_ns","ms","frame","roi","view":2,
 // "road_users":[...]} on the light socket.
+// low (optional): the second, low-score list (key "road_users_low", left out when nullptr).
 std::string road_users_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, double ms, int frame_w, int frame_h,
-                            const float *roi, const std::vector<RoadUserDet> &users);
+                            const float *roi, const std::vector<RoadUserDet> &users,
+                            const std::vector<RoadUserDet> *low = nullptr, const char *emb_kind = nullptr);
 
 // users: the frame's road users (key "road_users"), or nullptr; users_state: 0 = the key is left out
-// (--lights-road-users off), 1 = list, 2 = shed by the governor ("road_users": null).
+// (--lights-road-users off), 1 = list, 2 = shed by the governor ("road_users": null). users_low (optional, only
+// with users_state 1): the low-score list, key "road_users_low".
 std::string lights_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, double lights_ms, int frame_w,
                         int frame_h, const LightsConfig &cfg, const std::vector<LightTrackReport> &tracks,
                         const std::vector<LightDet> *raw = nullptr, const LightsTiming *timing = nullptr, int view = 0,
-                        const std::vector<RoadUserDet> *users = nullptr, int users_state = 0);
+                        const std::vector<RoadUserDet> *users = nullptr, int users_state = 0,
+                        const std::vector<RoadUserDet> *users_low = nullptr, const char *emb_kind = nullptr);
+// One road user as a JSON object (the element of "road_users" / "road_users_low").
+std::string road_user_json(const RoadUserDet &d);
 
 // Idle pattern (--lights-idle): the passes a second of `pattern` at `period_hz` frame periods a second (letters
 // other than '.' are passes), and the message key a consumer reads to judge the stream's rate while the light

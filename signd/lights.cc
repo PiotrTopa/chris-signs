@@ -9,6 +9,7 @@
 
 #include <unistd.h>
 
+#include "detin.h"
 #include "scale.h"
 
 namespace roadsense {
@@ -169,7 +170,27 @@ LightPipeline::LightPipeline(const LightsConfig &cfg) : cfg_(cfg) {
         sc.max_boxes = cfg_.ru_scale_max;
         sc.min_dt_s = cfg_.ru_scale_dt[0], sc.max_dt_s = cfg_.ru_scale_dt[1];
         sc.chain_max_gap_s = std::max(sc.chain_max_gap_s, sc.max_dt_s + 0.3);
+        sc.baselines = std::max(1, cfg_.ru_scale_multi);
+        sc.lamps = cfg_.ru_scale_lamps;
+        sc.patch = cfg_.ru_scale_patch;
         scale_.reset(new ScaleRateEstimator(sc));
+    }
+    if (!cfg_.ru_emb.empty() && cfg_.ru_emb != "yuv") {
+        if (access(cfg_.ru_emb.c_str(), R_OK) != 0) {
+            // like the state CNN: trained on material that is not shipped; without the file the model-free vector
+            fprintf(stderr, "signd: lights: embedding model %s not found, using the yuv3x3 vector\n", cfg_.ru_emb.c_str());
+            cfg_.ru_emb = "yuv";
+        } else {
+            RunnerOptions eo;
+            eo.backend = "ort";
+            eo.model = cfg_.ru_emb;
+            eo.threads = 1;
+            eo.input_shape = {1, 3, 32, 32};
+            eo.output_size = 32;
+            emb_ = make_runner(eo);
+            emb_in_.assign(size_t(3) * 32 * 32, 0.f);
+            emb_out_.assign(32, 0.f);
+        }
     }
     if (cfg_.state != "rule") {
         RunnerOptions so;
@@ -189,7 +210,22 @@ LightPipeline::~LightPipeline() = default;
 void LightPipeline::measure_scale(const Nv12View &f, int64_t ts_ns, LightsTiming *t) {
     if (!scale_) return;
     const auto t0 = Clock::now();
-    scale_->update(f, ts_ns, users_);
+    if (cfg_.ru_scale_lamps) {
+        // the estimator needs the lamp pairs: of the first list when the view cues did not find them already
+        // (they are not published then), of the low list always (its boxes carry no view cues)
+        const ViewConfig vc;
+        bool any = false;
+        for (const RoadUserDet &u : users_) any |= u.cls >= 2 && u.cls <= 5;
+        for (const RoadUserDet &u : users_low_) any |= u.cls >= 2 && u.cls <= 5;
+        if (any && frame_median_luma(f) <= vc.night_luma) {
+            if (!cfg_.ru_view)
+                for (RoadUserDet &u : users_)
+                    if (u.cls >= 2 && u.cls <= 5) ru_lamps(f, u, u.lamps, vc);
+            for (RoadUserDet &u : users_low_)
+                if (u.cls >= 2 && u.cls <= 5) ru_lamps(f, u, u.lamps, vc);
+        }
+    }
+    scale_->update(f, ts_ns, users_, cfg_.ru_thr_low > 0 ? &users_low_ : nullptr);
     const double ms = ms_since(t0);
     if (t) t->scale_ms = ms, t->total_ms += ms;
 }
@@ -198,6 +234,36 @@ const uint64_t *LightPipeline::scale_why() const { return scale_ ? scale_->why()
 
 void LightPipeline::reset_scale() {
     if (scale_) scale_->reset();
+}
+
+void LightPipeline::embed(const Nv12View &f) {
+    if (!emb_) {
+        for (RoadUserDet &u : users_) ru_appearance_yuv(f, u, u.emb);
+        for (RoadUserDet &u : users_low_) ru_appearance_yuv(f, u, u.emb);
+        return;
+    }
+    // the learnt embedding: one run per box, the largest boxes of the first list first, then the low list
+    std::vector<RoadUserDet *> bx;
+    for (RoadUserDet &u : users_) bx.push_back(&u);
+    const auto by_area = [](const RoadUserDet *a, const RoadUserDet *b) {
+        return (a->x1 - a->x0) * (a->y1 - a->y0) > (b->x1 - b->x0) * (b->y1 - b->y0);
+    };
+    std::stable_sort(bx.begin(), bx.end(), by_area);
+    const size_t nh = bx.size();
+    for (RoadUserDet &u : users_low_) bx.push_back(&u);
+    std::stable_sort(bx.begin() + long(nh), bx.end(), by_area);
+    int n = 0;
+    for (RoadUserDet *u : bx) {
+        if (n >= cfg_.ru_emb_max) break;
+        if (!ru_appearance_crop(f, *u, emb_in_.data())) continue;
+        emb_->run(emb_in_.data(), emb_out_.data());
+        double nn = 0;
+        for (float v : emb_out_) nn += double(v) * v;
+        nn = nn > 1e-12 ? 1.0 / std::sqrt(nn) : 0.0;
+        u->emb.n = 32;
+        for (int i = 0; i < 32; ++i) u->emb.v[i] = int8_t(std::max(-127.0, std::min(127.0, std::round(emb_out_[size_t(i)] * nn * 127.0))));
+        ++n;
+    }
 }
 
 void LightPipeline::classify(const Nv12View &f, LightDet &d) {
@@ -335,11 +401,14 @@ void LightPipeline::process(const Nv12View &f, std::vector<LightDet> &out, Light
         }
     }
     users_.clear();
+    users_low_.clear();
     if (ru_on_ || (view == 2 && cfg_.road_users)) {  // road users: same decode, the eight road classes, one class per box
         const auto tu = Clock::now();
-        std::vector<RoadUserDet> uc;
+        std::vector<RoadUserDet> uc, lc;
         float tmin = 1.f;
         for (int c = 0; c < 8; ++c) tmin = std::min(tmin, cfg_.ru_thr[c]);
+        const float tlow = cfg_.ru_thr_low > 0 ? cfg_.ru_thr_low : 2.f;  // second list: tlow < score <= class threshold
+        tmin = std::min(tmin, tlow);
         const float ex0 = float(rx0) + 2.f, ey0 = float(ry0) + 2.f, ex1 = float(std::min(rx1, double(f.width))) - 2.f,
                     ey1 = float(std::min(ry1, double(f.height))) - 2.f;
         for (size_t i = 0; i < N; ++i) {
@@ -349,7 +418,9 @@ void LightPipeline::process(const Nv12View &f, std::vector<LightDet> &out, Light
                 const float v = o[size_t(4 + c) * N + i];
                 if (v > bs) bs = v, bc = c;
             }
-            if (!(bs > tmin) || !(bs > cfg_.ru_thr[bc])) continue;
+            if (!(bs > tmin)) continue;
+            const bool high = bs > cfg_.ru_thr[bc];
+            if (!high && !(bs > tlow)) continue;
             const float cx = o[i], cy = o[N + i], w = o[2 * N + i], h = o[3 * N + i];
             RoadUserDet d;
             d.x0 = std::max(float(rx0 + (cx - w / 2) / r), 0.f);
@@ -360,7 +431,7 @@ void LightPipeline::process(const Nv12View &f, std::vector<LightDet> &out, Light
             d.score = bs, d.cls = bc;
             for (int c = 0; c < 8; ++c) d.p[c] = o[size_t(4 + c) * N + i];
             d.clip = (d.x0 <= ex0 ? 1 : 0) | (d.y0 <= ey0 ? 2 : 0) | (d.x1 >= ex1 ? 4 : 0) | (d.y1 >= ey1 ? 8 : 0);
-            uc.push_back(d);
+            (high ? uc : lc).push_back(d);
         }
         std::stable_sort(uc.begin(), uc.end(), [](const RoadUserDet &a, const RoadUserDet &b) { return a.score > b.score; });
         std::vector<char> ud(uc.size(), 0);
@@ -371,6 +442,26 @@ void LightPipeline::process(const Nv12View &f, std::vector<LightDet> &out, Light
             users_.push_back(uc[i]);
         }
         pair_riders(users_);
+        if (!lc.empty()) {
+            // The low list never changes the first one: a low box goes when a listed road user (after the rider
+            // pairing) or a better low box overlaps it by more than ru_nms.
+            std::stable_sort(lc.begin(), lc.end(), [](const RoadUserDet &a, const RoadUserDet &b) { return a.score > b.score; });
+            for (size_t i = 0; i < lc.size() && int(users_low_.size()) < cfg_.ru_low_max; ++i) {
+                bool keep = true;
+                for (size_t j = 0; j < users_.size() && keep; ++j) keep = !(iou4(&lc[i].x0, &users_[j].x0) > cfg_.ru_nms);
+                for (size_t j = 0; j < users_low_.size() && keep; ++j) keep = !(iou4(&lc[i].x0, &users_low_[j].x0) > cfg_.ru_nms);
+                if (keep) users_low_.push_back(lc[i]);
+            }
+        }
+        const auto tf = Clock::now();
+        if (cfg_.ru_flags) ru_flags(users_, &users_low_, f.width, f.height);
+        const auto tv = Clock::now();
+        if (cfg_.ru_view) ru_view(f, users_);
+        const auto te = Clock::now();
+        if (!cfg_.ru_emb.empty()) embed(f);
+        t.flags_ms = std::chrono::duration<double, std::milli>(tv - tf).count();
+        t.view_ms = std::chrono::duration<double, std::milli>(te - tv).count();
+        t.emb_ms = ms_since(te);
         t.users_ms = ms_since(tu);
     }
     const auto t3 = Clock::now();
@@ -532,7 +623,8 @@ void LightTracker::update(uint64_t, int64_t ts, const std::vector<LightDet> &det
 // ------------------------------------------------------------------ JSON ---
 
 std::string road_users_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, double ms, int frame_w, int frame_h,
-                            const float *roi, const std::vector<RoadUserDet> &users) {
+                            const float *roi, const std::vector<RoadUserDet> &users, const std::vector<RoadUserDet> *low,
+                            const char *emb_kind) {
     char b[320];
     snprintf(b, sizeof(b),
              "{\"type\":\"road_users\",\"seq\":%" PRIu64 ",\"ts_mono_ns\":%" PRId64 ",\"ts_real_ns\":%" PRId64
@@ -543,7 +635,7 @@ std::string road_users_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns
     // the same list as in a `lights` message: reuse its writer on an empty light message and cut the key out
     LightsConfig cfg;
     std::vector<LightTrackReport> none;
-    const std::string l = lights_json(0, 0, 0, 0, frame_w, frame_h, cfg, none, nullptr, nullptr, 0, &users, 1);
+    const std::string l = lights_json(0, 0, 0, 0, frame_w, frame_h, cfg, none, nullptr, nullptr, 0, &users, 1, low, emb_kind);
     const size_t k = l.find(",\"road_users\":");
     s += l.substr(k, l.size() - 1 - k);
     s += "}";
@@ -564,10 +656,66 @@ void add_lights_idle(std::string &msg, const std::string &pattern, double hz) {
     msg.insert(msg.size() - 1, ",\"idle\":{\"pattern\":\"" + p + "\",\"hz\":" + fmt(hz, 2) + "}");
 }
 
+namespace {
+void edge_letters(int bits, char *out) {
+    int n = 0;
+    if (bits & 1) out[n++] = 'l';
+    if (bits & 2) out[n++] = 't';
+    if (bits & 4) out[n++] = 'r';
+    if (bits & 8) out[n++] = 'b';
+    out[n] = 0;
+}
+}  // namespace
+
+// {"cls", "score", "box" [x0,y0,x1,y1] frame px, "clip" (edges of the view's region the box touches: l t r b),
+//  "rider" (bike / motor with its rider paired), "p" (the eight class scores, BDD100K order)}, then the optional keys
+std::string road_user_json(const RoadUserDet &d) {
+    char b[512], clip[5];
+    edge_letters(d.clip, clip);
+    snprintf(b, sizeof(b),
+             "{\"cls\":\"%s\",\"score\":%s,\"box\":[%s,%s,%s,%s],\"clip\":\"%s\",\"rider\":%s,"
+             "\"p\":[%s,%s,%s,%s,%s,%s,%s,%s]",
+             road_user_name(d.cls), fmt(d.score, 3).c_str(), fmt(d.x0, 1).c_str(), fmt(d.y0, 1).c_str(),
+             fmt(d.x1, 1).c_str(), fmt(d.y1, 1).c_str(), clip, d.rider ? "true" : "false", fmt(d.p[0], 2).c_str(),
+             fmt(d.p[1], 2).c_str(), fmt(d.p[2], 2).c_str(), fmt(d.p[3], 2).c_str(), fmt(d.p[4], 2).c_str(),
+             fmt(d.p[5], 2).c_str(), fmt(d.p[6], 2).c_str(), fmt(d.p[7], 2).c_str());
+    std::string s = b;
+    // optional "scale_rate", "scale_rate_std" (1/s), "scale_dt_s" (s): image scale change (--lights-ru-scale)
+    if (d.scale_ok)
+        s += ",\"scale_rate\":" + fmt(d.scale_rate, 4) + ",\"scale_rate_std\":" + fmt(d.scale_rate_std, 4) +
+             ",\"scale_dt_s\":" + fmt(d.scale_dt_s, 3) +
+             (d.scale_src == kSrcLamps ? ",\"scale_src\":\"lamps\"" : d.scale_src == kSrcBoth ? ",\"scale_src\":\"both\"" : "");
+    // optional (--lights-ru-flags): "trunc" (frame edges that cut the box; always there when the flags are on),
+    // "occ" (share covered by nearer boxes), "occ_by" (index into "road_users"), "occ_edges" (its hidden edges);
+    // the three occ keys only when something covers the box
+    if (d.flags) {
+        edge_letters(d.trunc, clip);
+        s += std::string(",\"trunc\":\"") + clip + "\"";
+        if (d.occ > 0 && d.occ_by >= 0) {
+            edge_letters(d.occ_edges, clip);
+            s += ",\"occ\":" + fmt(d.occ, 2) + ",\"occ_by\":" + std::to_string(d.occ_by) + ",\"occ_edges\":\"" + clip + "\"";
+        }
+    }
+    // optional (--lights-ru-view): "sym" (mirror symmetry of the box's image, -1..1), "lamps" (the lamp pair of a
+    // vehicle in the dark: colour, left and right centroid, their distance and its 1-sigma, frame px)
+    if (d.view) {
+        if (d.sym >= -1.f) s += ",\"sym\":" + fmt(d.sym, 2);
+        if (d.lamps.ok)
+            s += std::string(",\"lamps\":{\"c\":\"") + lamp_colour_name(d.lamps.colour) + "\",\"l\":[" + fmt(d.lamps.xl, 1) + "," +
+                 fmt(d.lamps.yl, 1) + "],\"r\":[" + fmt(d.lamps.xr, 1) + "," + fmt(d.lamps.yr, 1) + "],\"sep\":" + fmt(d.lamps.sep, 2) +
+                 ",\"sep_std\":" + fmt(d.lamps.sep_std, 2) + "}";
+    }
+    // optional (--lights-ru-emb): "emb", the appearance vector as hex of its int8 values (kind: message key emb_kind)
+    if (d.emb.n > 0) s += ",\"emb\":\"" + appearance_hex(d.emb) + "\"";
+    s += "}";
+    return s;
+}
+
 std::string lights_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, double lights_ms, int frame_w,
                         int frame_h, const LightsConfig &cfg, const std::vector<LightTrackReport> &tracks,
                         const std::vector<LightDet> *raw, const LightsTiming *tm, int view,
-                        const std::vector<RoadUserDet> *users, int users_state) {
+                        const std::vector<RoadUserDet> *users, int users_state, const std::vector<RoadUserDet> *users_low,
+                        const char *emb_kind) {
     const bool v2 = cfg.roi2[2] > cfg.roi2[0] && cfg.roi2[3] > cfg.roi2[1];
     const float *roi = view == 1 && v2 ? cfg.roi2 : cfg.roi;
     char b[512];
@@ -608,30 +756,14 @@ std::string lights_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, do
         // {"cls", "score", "box" [x0,y0,x1,y1] frame px, "clip" (edges of the view's region the box touches: l t r b),
         //  "rider" (bike / motor with its rider paired), "p" (the eight class scores, BDD100K order)}
         s += ",\"road_users\":[";
-        for (size_t i = 0; i < users->size(); ++i) {
-            const RoadUserDet &d = (*users)[i];
-            char clip[5];
-            int n = 0;
-            if (d.clip & 1) clip[n++] = 'l';
-            if (d.clip & 2) clip[n++] = 't';
-            if (d.clip & 4) clip[n++] = 'r';
-            if (d.clip & 8) clip[n++] = 'b';
-            clip[n] = 0;
-            // optional "scale_rate", "scale_rate_std" (1/s), "scale_dt_s" (s): image scale change (--lights-ru-scale)
-            char sr[96] = "";
-            if (d.scale_ok)
-                snprintf(sr, sizeof(sr), ",\"scale_rate\":%s,\"scale_rate_std\":%s,\"scale_dt_s\":%s", fmt(d.scale_rate, 4).c_str(),
-                         fmt(d.scale_rate_std, 4).c_str(), fmt(d.scale_dt_s, 3).c_str());
-            snprintf(b, sizeof(b),
-                     "%s{\"cls\":\"%s\",\"score\":%s,\"box\":[%s,%s,%s,%s],\"clip\":\"%s\",\"rider\":%s,"
-                     "\"p\":[%s,%s,%s,%s,%s,%s,%s,%s]%s}",
-                     i ? "," : "", road_user_name(d.cls), fmt(d.score, 3).c_str(), fmt(d.x0, 1).c_str(), fmt(d.y0, 1).c_str(),
-                     fmt(d.x1, 1).c_str(), fmt(d.y1, 1).c_str(), clip, d.rider ? "true" : "false", fmt(d.p[0], 2).c_str(),
-                     fmt(d.p[1], 2).c_str(), fmt(d.p[2], 2).c_str(), fmt(d.p[3], 2).c_str(), fmt(d.p[4], 2).c_str(),
-                     fmt(d.p[5], 2).c_str(), fmt(d.p[6], 2).c_str(), fmt(d.p[7], 2).c_str(), sr);
-            s += b;
-        }
+        for (size_t i = 0; i < users->size(); ++i) s += (i ? "," : "") + road_user_json((*users)[i]);
         s += "]";
+        if (users_low) {
+            s += ",\"road_users_low\":[";
+            for (size_t i = 0; i < users_low->size(); ++i) s += (i ? "," : "") + road_user_json((*users_low)[i]);
+            s += "]";
+        }
+        if (emb_kind && *emb_kind) s += std::string(",\"emb_kind\":\"") + emb_kind + "\"";
     }
     if (tm) {
         snprintf(b, sizeof(b), ",\"timing\":{\"pre_ms\":%s,\"det_ms\":%s,\"post_ms\":%s,\"state_ms\":%s,\"wait_ms\":%s,\"users_ms\":%s}",
@@ -639,6 +771,8 @@ std::string lights_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, do
                  fmt(tm->state_ms, 2).c_str(), fmt(tm->wait_ms, 2).c_str(), fmt(tm->users_ms, 3).c_str());
         s += b;
         if (tm->scale_ms >= 0) s.insert(s.size() - 1, ",\"scale_ms\":" + fmt(tm->scale_ms, 3));
+        if (tm->flags_ms > 0 || tm->view_ms > 0 || tm->emb_ms > 0)
+            s.insert(s.size() - 1, ",\"flags_ms\":" + fmt(tm->flags_ms, 3) + ",\"view_ms\":" + fmt(tm->view_ms, 3) + ",\"emb_ms\":" + fmt(tm->emb_ms, 3));
     }
     s += "}";
     return s;

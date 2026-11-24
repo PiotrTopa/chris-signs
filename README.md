@@ -1,6 +1,6 @@
 # roadsense-signs
 
-Traffic-sign provider for [roadsense](https://github.com/PiotrTopa/roadsense):
+Traffic-sign provider for [roadsense](https://github.com/PiotrTopa/chris-roadsense):
 `signd` reads camera frames from roadsense's shared-memory frame ring, runs a
 class-agnostic YOLOv8n sign detector (384x640) and a 400-class Mapillary (MTSD)
 YOLOv8n-cls classifier on each box with ONNX Runtime on the CPU (or ncnn on the
@@ -21,7 +21,7 @@ band of the picture for the near road users.
 docs/LIGHT_MODELS.md; checks: `build/scale_rate_test`, `tools/road_users/scale_check.py`).
 
 Split out of roadsense at commit
-[`246e68a`](https://github.com/PiotrTopa/roadsense/commit/246e68a) (where it
+[`246e68a`](https://github.com/PiotrTopa/chris-roadsense/commit/246e68a) (where it
 lived as `signd/`, `tools/signd_replay.cc` and `docs/SIGN_MODELS.md`), renamed
 from pocopilot to roadsense on the way.
 

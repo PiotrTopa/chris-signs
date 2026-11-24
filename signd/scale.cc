@@ -567,7 +567,7 @@ void ScaleRateEstimator::update(const Nv12View &f, int64_t ts, std::vector<RoadU
             u.scale_rate = float(p_rate), u.scale_rate_std = float(p_std), u.scale_dt_s = float(p_dt);
         } else if (l_ok) {
             u.scale_ok = true, u.scale_src = kSrcLamps;
-            u.scale_rate = float(l_rate), u.scale_rate_std = float(l_std), u.scale_dt_s = float(l_dt);
+            u.scale_rate = float(l_rate), u.scale_rate_std = float(l_std * cfg_.lamp_only_std_x), u.scale_dt_s = float(l_dt);
             ++why_[kLampOnly];
         }
         ++why_[why];

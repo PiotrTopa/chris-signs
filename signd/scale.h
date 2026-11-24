@@ -61,6 +61,11 @@ struct ScaleConfig {
     double lamp_min_sep = 10.0;  // px: below, the pair picked flips between lamps and reflections (measured: 0.8 px)
     int lamp_min_n = 3;          // passes with the pair in the window (the fit's own scatter needs a third point)
     double lamp_huber = 1.5;     // the line fit down-weights a pass further than this many sigma from it
+    // A value from the lamp pair alone is published with its fitted std times this: on two night rides successive
+    // lamp-only values of far objects disagreed by 1.35-1.6 of their fitted std (pairs of blobs that change, glare
+    // in fog), which the line fit's own scatter does not see. In a combination with a patch value the fitted std is
+    // used (the patch value dominates there and the two are compared).
+    double lamp_only_std_x = 1.5;
     double lamp_max_std = 0.12;  // stated 1-sigma of the lamp rate (1/s) above which it is not used
     double agree_sigma = 3.0;    // patch and lamp values further apart than this (in their combined sigma) disagree:
                                  // the mean is given with half their difference added to its std

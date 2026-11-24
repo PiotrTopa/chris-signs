@@ -81,8 +81,9 @@ struct LightsConfig {
     //   ru_view (--lights-ru-view): view cues of vehicles from the box's own pixels, no model: `sym` (mirror
     //     symmetry), `lamps` (the lamp pair of a vehicle in the dark: centroids, separation, colour).
     //   ru_emb (--lights-ru-emb yuv | PATH.onnx): an appearance vector per box (`emb`, hex of int8) and the message
-    //     key `emb_kind`: "yuv" = the model-free yuv3x3 vector; a file = the learnt 32-number embedding (ORT, one
-    //     run per box, at most ru_emb_max boxes a pass, largest first; the others carry none).
+    //     key `emb_kind`: "yuv" = the model-free yuv3x3 vector; a file = the learnt 32-number embedding followed by
+    //     the yuv3x3 numbers (ORT, one run per box, at most ru_emb_max boxes a pass, largest first; the others
+    //     carry none).
     std::string ru_emb;
     int ru_emb_max = 16;
     float ru_thr_low = 0.f;
@@ -168,8 +169,8 @@ public:
     const LightsConfig &config() const { return cfg_; }
     const char *backend() const { return det_->name(); }
     bool has_state_cnn() const { return bool(st_); }
-    // "" (off), "yuv3x3" or "reid32": the kind of the road users' appearance vectors (message key `emb_kind`)
-    const char *emb_kind() const { return cfg_.ru_emb.empty() ? "" : emb_ ? "reid32" : "yuv3x3"; }
+    // "" (off), "yuv3x3" or "reid32+yuv3x3": the kind of the road users' appearance vectors (message key `emb_kind`)
+    const char *emb_kind() const { return cfg_.ru_emb.empty() ? "" : emb_ ? "reid32+yuv3x3" : "yuv3x3"; }
     // The sign proposals of the last process() call (empty unless cfg.sign_cls >= 0), frame pixels, NMS'd.
     const std::vector<LightDet> &sign_boxes() const { return signs_; }
     // The road users of the last process() call (empty unless cfg.road_users and process() was asked to decode

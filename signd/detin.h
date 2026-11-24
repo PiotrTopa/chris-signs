@@ -83,9 +83,11 @@ void ru_view(const Nv12View &f, std::vector<RoadUserDet> &users, const ViewConfi
 //             nine Y, nine Cb, nine Cr; Y in units of 50 grey levels about 110, chroma in units of 20 about 128,
 //             published x 32 as int8). On the ride library it re-identifies better than any pooled feature map
 //             of the detector (docs/DETECTION_INPUTS.md).
-//   "reid32"  a small network on the 32 x 32 crop (tools/reid/train_reid.py), 32 numbers, L2-normalised,
-//             published x 127 as int8 (LightPipeline runs it; this header only holds the crop geometry).
-constexpr int kEmbMax = 48;
+//   "reid32+yuv3x3"  a small network on the 32 x 32 crop (tools/reid/train_reid.py): 32 numbers, L2-normalised,
+//             published x 127 as int8, FOLLOWED by the 27 yuv3x3 numbers (x 32): 59 values. The distance to use is
+//             sqrt(|d learnt / 127|^2 + (0.5 |d yuv / 32|)^2): on held-out rides the two together re-identify
+//             better than either (LightPipeline runs the network; this header only holds the crop geometry).
+constexpr int kEmbMax = 64;
 struct Appearance {
     int n = 0;                 // 0: none
     int8_t v[kEmbMax] = {};

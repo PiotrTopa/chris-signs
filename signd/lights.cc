@@ -242,7 +242,8 @@ void LightPipeline::embed(const Nv12View &f) {
         for (RoadUserDet &u : users_low_) ru_appearance_yuv(f, u, u.emb);
         return;
     }
-    // the learnt embedding: one run per box, the largest boxes of the first list first, then the low list
+    // the learnt embedding followed by the yuv3x3 numbers: one run per box, the largest boxes of the first list
+    // first, then the low list
     std::vector<RoadUserDet *> bx;
     for (RoadUserDet &u : users_) bx.push_back(&u);
     const auto by_area = [](const RoadUserDet *a, const RoadUserDet *b) {
@@ -260,8 +261,11 @@ void LightPipeline::embed(const Nv12View &f) {
         double nn = 0;
         for (float v : emb_out_) nn += double(v) * v;
         nn = nn > 1e-12 ? 1.0 / std::sqrt(nn) : 0.0;
-        u->emb.n = 32;
+        Appearance y;
+        if (!ru_appearance_yuv(f, *u, y)) continue;
+        u->emb.n = 32 + y.n;
         for (int i = 0; i < 32; ++i) u->emb.v[i] = int8_t(std::max(-127.0, std::min(127.0, std::round(emb_out_[size_t(i)] * nn * 127.0))));
+        for (int i = 0; i < y.n; ++i) u->emb.v[32 + i] = y.v[i];
         ++n;
     }
 }

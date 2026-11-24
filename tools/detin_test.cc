@@ -1,14 +1,17 @@
 // detin_test: checks of signd/detin.h that need no model (flags, the low-score list's message key, ...).
 // Exit code 0 = all passed.
 //   cmake --build build --target detin_test && build/detin_test
+//   build/detin_test --bench             time per box of the flags, the view cues and the yuv3x3 vector (one thread)
 //   build/detin_test --flags W H < boxes   evaluation helper: lines "image x0 y0 x1 y1 [clip-bits]" (one box per
 //                                          line, boxes of one image on consecutive lines) -> the same lines with
 //                                          " trunc-bits occ occ_by occ_edges-bits" appended (signd's own code on
 //                                          boxes from elsewhere, e.g. a data set's labels)
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -92,8 +95,49 @@ int flags_tool(int fw, int fh) {
 }
 }  // namespace
 
+// Median over 2001 repetitions of the time of fn(), in microseconds.
+template <class F>
+double bench_us(F fn) {
+    std::vector<double> t;
+    for (int i = 0; i < 2001; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        fn();
+        t.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+    }
+    std::nth_element(t.begin(), t.begin() + long(t.size() / 2), t.end());
+    return t[t.size() / 2];
+}
+
+int bench() {
+    // a dark frame with lamp pairs of three sizes; boxes around them
+    const Frame f(25, {{100, 100, 1.5, 600, 112, 170}, {113, 100, 1.5, 600, 112, 170}, {300, 150, 3, 600, 112, 170}, {338, 150, 3, 600, 112, 170},
+                       {480, 220, 7, 600, 128, 128}, {590, 220, 7, 600, 128, 128}});
+    const RoadUserDet bx[3] = {box(2, 96, 92, 117, 108), box(2, 290, 126, 350, 174), box(2, 445, 165, 625, 285)};
+    const char *nm[3] = {"21 x 16 px", "60 x 48 px", "180 x 120 px"};
+    printf("%-14s %10s %10s %10s   (microseconds per box, median of 2001)\n", "box", "sym", "lamps", "yuv3x3");
+    volatile float sink = 0;
+    for (int i = 0; i < 3; ++i) {
+        LampPair lp;
+        Appearance a;
+        const double ts = bench_us([&] { sink = sink + ru_symmetry(f.view(), bx[i]); });
+        const double tl = bench_us([&] { ru_lamps(f.view(), bx[i], lp), sink = sink + lp.sep; });
+        const double ta = bench_us([&] { ru_appearance_yuv(f.view(), bx[i], a), sink = sink + a.v[0]; });
+        printf("%-14s %10.2f %10.2f %10.2f   lamps found: %d\n", nm[i], ts, tl, ta, int(lp.ok));
+    }
+    for (int n : {4, 12, 40}) {  // flags: n overlapping boxes
+        std::vector<RoadUserDet> v;
+        for (int i = 0; i < n; ++i) v.push_back(box(2, 50.f + 12.f * i, 100.f + 3.f * (i % 5), 110.f + 12.f * i, 150.f + 4.f * (i % 7)));
+        const double t = bench_us([&] { ru_flags(v, nullptr, 640, 360), sink = sink + v[0].occ; });
+        printf("flags, %2d boxes in one message: %.2f microseconds (%.3f per box)\n", n, t, t / n);
+    }
+    const double tm = bench_us([&] { sink = sink + frame_median_luma(f.view()); });
+    printf("frame darkness test (640 x 360; a 1280 x 720 frame has four times the samples): %.2f microseconds\n", tm);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc == 4 && !strcmp(argv[1], "--flags")) return flags_tool(atoi(argv[2]), atoi(argv[3]));
+    if (argc == 2 && !strcmp(argv[1], "--bench")) return bench();
     {   // a far car half behind a near one: the far one is covered, the near one is not
         std::vector<RoadUserDet> v = {box(2, 100, 100, 200, 180), box(2, 150, 90, 230, 150)};
         ru_flags(v, nullptr, 1280, 720);

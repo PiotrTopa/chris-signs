@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "detin.h"
+#include "pose.h"
 #include "runner.h"
 #include "yolo.h"
 
@@ -86,6 +87,15 @@ struct LightsConfig {
     //     carry none).
     std::string ru_emb;
     int ru_emb_max = 16;
+    //   ru_pose (--lights-ru-pose PATH.onnx): heading and ground contact points per box from a trained head
+    //     (signd/pose.h, docs/POSE_HEAD.md): `pose` per box and the message key `pose_kind`. One ORT run per box, at
+    //     most ru_pose_max boxes a pass (first list by size, then the low list; with more boxes than that the passes
+    //     take turns through the list); vehicles only unless ru_pose_all. ru_pose_cam = the camera's focal length and principal point in frame px (f, cu, cv; f 0:
+    //     not known), given to the head. The model file is not part of this repository; a missing file = off.
+    std::string ru_pose;
+    int ru_pose_max = 4;
+    bool ru_pose_all = false;
+    float ru_pose_cam[3] = {0.f, 0.f, 0.f};
     float ru_thr_low = 0.f;
     int ru_low_max = 20;
     bool ru_flags = false;
@@ -142,6 +152,7 @@ struct RoadUserDet {
     float sym = -2.f;
     LampPair lamps;
     Appearance emb;  // LightsConfig::ru_emb; emb.n = 0: none
+    RuPose pose;     // LightsConfig::ru_pose; pose.ok false: none
 };
 const char *road_user_name(int cls);
 
@@ -149,6 +160,7 @@ struct LightsTiming {
     double pre_ms = 0, det_ms = 0, post_ms = 0, state_ms = 0, total_ms = 0, wait_ms = 0, users_ms = 0;
     double scale_ms = -1;  // measure_scale() of this pass (< 0: not run)
     double flags_ms = 0, view_ms = 0, emb_ms = 0;  // parts of users_ms (detection inputs, signd/detin.h)
+    double pose_ms = 0;                            // ... the pose head (signd/pose.h)
 };
 
 class LightPipeline {
@@ -171,6 +183,8 @@ public:
     bool has_state_cnn() const { return bool(st_); }
     // "" (off), "yuv3x3" or "reid32+yuv3x3": the kind of the road users' appearance vectors (message key `emb_kind`)
     const char *emb_kind() const { return cfg_.ru_emb.empty() ? "" : emb_ ? "reid32+yuv3x3" : "yuv3x3"; }
+    // "" (off or no model file) or "pose1": the contract of the road users' `pose` (message key `pose_kind`)
+    const char *pose_kind() const { return pose_ ? "pose1" : ""; }
     // The sign proposals of the last process() call (empty unless cfg.sign_cls >= 0), frame pixels, NMS'd.
     const std::vector<LightDet> &sign_boxes() const { return signs_; }
     // The road users of the last process() call (empty unless cfg.road_users and process() was asked to decode
@@ -196,9 +210,11 @@ public:
 private:
     void classify(const Nv12View &f, LightDet &d);
     LightsConfig cfg_;
-    std::unique_ptr<ModelRunner> det_, st_, emb_;
-    std::vector<float> emb_in_, emb_out_;
+    std::unique_ptr<ModelRunner> det_, st_, emb_, pose_;
+    std::vector<float> emb_in_, emb_out_, pose_in_, pose_out_;
     void embed(const Nv12View &f);
+    void pose(const Nv12View &f);
+    size_t pose_rr_ = 0;  // where the next pass starts in the list when there are more boxes than ru_pose_max
     int n_anchor_ = 0, lb_w_ = -1, lb_h_ = -1;
     std::vector<float> in_, out_, st_in_, st_out_;
     std::vector<float> rgb_;
@@ -288,7 +304,8 @@ private:
 // low (optional): the second, low-score list (key "road_users_low", left out when nullptr).
 std::string road_users_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, double ms, int frame_w, int frame_h,
                             const float *roi, const std::vector<RoadUserDet> &users,
-                            const std::vector<RoadUserDet> *low = nullptr, const char *emb_kind = nullptr);
+                            const std::vector<RoadUserDet> *low = nullptr, const char *emb_kind = nullptr,
+                            const char *pose_kind = nullptr);
 
 // users: the frame's road users (key "road_users"), or nullptr; users_state: 0 = the key is left out
 // (--lights-road-users off), 1 = list, 2 = shed by the governor ("road_users": null). users_low (optional, only
@@ -297,7 +314,8 @@ std::string lights_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, do
                         int frame_h, const LightsConfig &cfg, const std::vector<LightTrackReport> &tracks,
                         const std::vector<LightDet> *raw = nullptr, const LightsTiming *timing = nullptr, int view = 0,
                         const std::vector<RoadUserDet> *users = nullptr, int users_state = 0,
-                        const std::vector<RoadUserDet> *users_low = nullptr, const char *emb_kind = nullptr);
+                        const std::vector<RoadUserDet> *users_low = nullptr, const char *emb_kind = nullptr,
+                        const char *pose_kind = nullptr);
 // One road user as a JSON object (the element of "road_users" / "road_users_low").
 std::string road_user_json(const RoadUserDet &d);
 

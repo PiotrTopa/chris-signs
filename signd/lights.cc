@@ -192,6 +192,22 @@ LightPipeline::LightPipeline(const LightsConfig &cfg) : cfg_(cfg) {
             emb_out_.assign(32, 0.f);
         }
     }
+    if (!cfg_.ru_pose.empty()) {
+        if (access(cfg_.ru_pose.c_str(), R_OK) != 0) {
+            // trained and distributed elsewhere (chris-pose, its own licence); without the file: no pose
+            fprintf(stderr, "signd: lights: pose model %s not found, no pose\n", cfg_.ru_pose.c_str());
+        } else {
+            RunnerOptions po;
+            po.backend = "ort";
+            po.model = cfg_.ru_pose;
+            po.threads = 1;
+            po.input_shape = {1, 3 + kPoseG, kPoseS, kPoseS};
+            po.output_size = kPoseOut;
+            pose_ = make_runner(po);
+            pose_in_.assign(size_t(3 + kPoseG) * kPoseS * kPoseS, 0.f);
+            pose_out_.assign(kPoseOut, 0.f);
+        }
+    }
     if (cfg_.state != "rule") {
         RunnerOptions so;
         so.backend = "ort";
@@ -266,6 +282,45 @@ void LightPipeline::embed(const Nv12View &f) {
         u->emb.n = 32 + y.n;
         for (int i = 0; i < 32; ++i) u->emb.v[i] = int8_t(std::max(-127.0, std::min(127.0, std::round(emb_out_[size_t(i)] * nn * 127.0))));
         for (int i = 0; i < y.n; ++i) u->emb.v[32 + i] = y.v[i];
+        ++n;
+    }
+}
+
+void LightPipeline::pose(const Nv12View &f) {
+    if (!pose_) return;
+    // one run per box; the order: the first list by size, then the low list by size
+    std::vector<RoadUserDet *> bx;
+    const auto wanted = [this](const RoadUserDet &u) { return cfg_.ru_pose_all || (u.cls >= 2 && u.cls <= 5); };
+    for (RoadUserDet &u : users_)
+        if (wanted(u)) bx.push_back(&u);
+    const auto by_area = [](const RoadUserDet *a, const RoadUserDet *b) {
+        return (a->x1 - a->x0) * (a->y1 - a->y0) > (b->x1 - b->x0) * (b->y1 - b->y0);
+    };
+    std::stable_sort(bx.begin(), bx.end(), by_area);
+    const size_t nh = bx.size();
+    for (RoadUserDet &u : users_low_)
+        if (wanted(u)) bx.push_back(&u);
+    std::stable_sort(bx.begin() + long(nh), bx.end(), by_area);
+    PoseCam cam;
+    cam.ok = cfg_.ru_pose_cam[0] > 1.f;
+    cam.f = cfg_.ru_pose_cam[0], cam.cu = cfg_.ru_pose_cam[1], cam.cv = cfg_.ru_pose_cam[2];
+    // More boxes than the cap: the passes take turns through the list (pass k starts where pass k - 1 stopped), so
+    // that every box gets a pose every few passes instead of the largest ones getting one in every pass.
+    const size_t nb = bx.size();
+    const size_t cap = size_t(std::max(0, cfg_.ru_pose_max));
+    size_t start = 0;
+    if (nb > cap && cap > 0) {
+        start = pose_rr_ % nb;
+        pose_rr_ = (start + cap) % nb;
+    } else {
+        pose_rr_ = 0;
+    }
+    size_t n = 0;
+    for (size_t k = 0; k < nb && n < cap; ++k) {
+        RoadUserDet *u = bx[(start + k) % nb];
+        if (!ru_pose_input(f, *u, u->clip | u->trunc, cam, pose_in_.data())) continue;
+        pose_->run(pose_in_.data(), pose_out_.data());
+        ru_pose_decode(pose_out_.data(), *u, u->pose);
         ++n;
     }
 }
@@ -466,6 +521,11 @@ void LightPipeline::process(const Nv12View &f, std::vector<LightDet> &out, Light
         t.flags_ms = std::chrono::duration<double, std::milli>(tv - tf).count();
         t.view_ms = std::chrono::duration<double, std::milli>(te - tv).count();
         t.emb_ms = ms_since(te);
+        if (pose_) {
+            const auto tp = Clock::now();
+            pose(f);
+            t.pose_ms = ms_since(tp);
+        }
         t.users_ms = ms_since(tu);
     }
     const auto t3 = Clock::now();
@@ -628,7 +688,7 @@ void LightTracker::update(uint64_t, int64_t ts, const std::vector<LightDet> &det
 
 std::string road_users_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, double ms, int frame_w, int frame_h,
                             const float *roi, const std::vector<RoadUserDet> &users, const std::vector<RoadUserDet> *low,
-                            const char *emb_kind) {
+                            const char *emb_kind, const char *pose_kind) {
     char b[320];
     snprintf(b, sizeof(b),
              "{\"type\":\"road_users\",\"seq\":%" PRIu64 ",\"ts_mono_ns\":%" PRId64 ",\"ts_real_ns\":%" PRId64
@@ -639,7 +699,7 @@ std::string road_users_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns
     // the same list as in a `lights` message: reuse its writer on an empty light message and cut the key out
     LightsConfig cfg;
     std::vector<LightTrackReport> none;
-    const std::string l = lights_json(0, 0, 0, 0, frame_w, frame_h, cfg, none, nullptr, nullptr, 0, &users, 1, low, emb_kind);
+    const std::string l = lights_json(0, 0, 0, 0, frame_w, frame_h, cfg, none, nullptr, nullptr, 0, &users, 1, low, emb_kind, pose_kind);
     const size_t k = l.find(",\"road_users\":");
     s += l.substr(k, l.size() - 1 - k);
     s += "}";
@@ -711,6 +771,8 @@ std::string road_user_json(const RoadUserDet &d) {
     }
     // optional (--lights-ru-emb): "emb", the appearance vector as hex of its int8 values (kind: message key emb_kind)
     if (d.emb.n > 0) s += ",\"emb\":\"" + appearance_hex(d.emb) + "\"";
+    // optional (--lights-ru-pose): "pose", heading and ground points from the trained head (signd/pose.h)
+    if (d.pose.ok) s += pose_json(d.pose);
     s += "}";
     return s;
 }
@@ -719,7 +781,7 @@ std::string lights_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, do
                         int frame_h, const LightsConfig &cfg, const std::vector<LightTrackReport> &tracks,
                         const std::vector<LightDet> *raw, const LightsTiming *tm, int view,
                         const std::vector<RoadUserDet> *users, int users_state, const std::vector<RoadUserDet> *users_low,
-                        const char *emb_kind) {
+                        const char *emb_kind, const char *pose_kind) {
     const bool v2 = cfg.roi2[2] > cfg.roi2[0] && cfg.roi2[3] > cfg.roi2[1];
     const float *roi = view == 1 && v2 ? cfg.roi2 : cfg.roi;
     char b[512];
@@ -768,6 +830,7 @@ std::string lights_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, do
             s += "]";
         }
         if (emb_kind && *emb_kind) s += std::string(",\"emb_kind\":\"") + emb_kind + "\"";
+        if (pose_kind && *pose_kind) s += std::string(",\"pose_kind\":\"") + pose_kind + "\"";
     }
     if (tm) {
         snprintf(b, sizeof(b), ",\"timing\":{\"pre_ms\":%s,\"det_ms\":%s,\"post_ms\":%s,\"state_ms\":%s,\"wait_ms\":%s,\"users_ms\":%s}",
@@ -777,6 +840,7 @@ std::string lights_json(uint64_t seq, int64_t ts_mono_ns, int64_t ts_real_ns, do
         if (tm->scale_ms >= 0) s.insert(s.size() - 1, ",\"scale_ms\":" + fmt(tm->scale_ms, 3));
         if (tm->flags_ms > 0 || tm->view_ms > 0 || tm->emb_ms > 0)
             s.insert(s.size() - 1, ",\"flags_ms\":" + fmt(tm->flags_ms, 3) + ",\"view_ms\":" + fmt(tm->view_ms, 3) + ",\"emb_ms\":" + fmt(tm->emb_ms, 3));
+        if (tm->pose_ms > 0) s.insert(s.size() - 1, ",\"pose_ms\":" + fmt(tm->pose_ms, 3));
     }
     s += "}";
     return s;

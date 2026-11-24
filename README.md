@@ -19,6 +19,15 @@ band of the picture for the near road users.
 `scale_rate_std`, `scale_dt_s`: d ln(size)/dt from patch alignment against the same object
 0.2-1 s earlier, for range rate and time to contact; section "Image scale change" of
 docs/LIGHT_MODELS.md; checks: `build/scale_rate_test`, `tools/road_users/scale_check.py`).
+Detection inputs for a tracker (all off by default, each adds only optional keys;
+[docs/DETECTION_INPUTS.md](docs/DETECTION_INPUTS.md)): `--lights-ru-low X` (the boxes below the
+class thresholds as a list of their own, `road_users_low`, for a second association stage),
+`--lights-ru-flags` (`trunc`, `occ`, `occ_by`, `occ_edges`: cut by the frame, covered by a nearer
+box), `--lights-ru-view` (`sym`, `lamps`: mirror symmetry, the lamp pair of a vehicle in the dark),
+`--lights-ru-emb yuv|FILE.onnx` (`emb`: an appearance vector for re-identification),
+`--lights-ru-scale-lamps` / `--lights-ru-scale-multi N` (the scale rate in the dark from the lamp
+pair's separation; several baselines). Checks: `build/detin_test`, `build/scale_rate_test`,
+`tools/road_users/detin_bdd.py`, `tools/road_users/low_check.py`, `tools/reid/`.
 
 Split out of roadsense at commit
 [`246e68a`](https://github.com/PiotrTopa/roadsense/commit/246e68a) (where it

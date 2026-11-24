@@ -4,7 +4,7 @@ PartOf=roadsense.target
 After=roadsense-camerad.service
 Wants=roadsense-camerad.service
 
-# --lights-road-users (roadsense lane L42): the light detector's road users (person, rider, car, truck, bus,
+# --lights-road-users --lights-ru-scale (roadsense lane L42): the light detector's road users (person, rider, car, truck, bus,
 # train, motor, bike) go out in every lights message, decoded from the inference that runs for the lights (no
 # extra detector run); the governor's first step pauses them. The optional road-user view (--lights-ru-roi, an
 # extra detector run for near road users) is not enabled here.
@@ -70,7 +70,18 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/shm/roadsense-frames
 # floor. L48 (roadsense docs/lanes/L48-system-optimisation.md 3.2, L48-phone-results.md P2): 0.24-0.59 W and 4-6 K
 # on the big cores less, light-time 96.9 -> 96.8 % / 98.9 -> 99.5 % on the phone's backend. Sparser patterns (one
 # pass in 2, 3, 4 periods) lose far-light time measurably (L53 report); `--lights-idle` removed = the old schedule.
-ExecStart=/usr/local/bin/signd --det-backend ncnn --cls-backend ort --threads 2 --cpus 4-7 --max-hz 5 --gpu-sync turn --stats 10 --lights --lights-backend ncnn-cpu --lights-threads 2 --lights-cpus 4-7 --lights-hz 5 --lights-roi2 0.125,0.125,0.875,0.569 --lights-thr-keep 0.12 --lights-coast 3 --lights-road-users --lights-state /var/lib/roadsense/models/lights_state_car_48x24.onnx,/var/lib/roadsense/models/lights_state_bdd_48x24.onnx --verifier /var/lib/roadsense/models/sign_verifier_32.onnx --class-min-score regulatory--no-entry=0.71 --cls /var/lib/roadsense/models/mtsd_signcls_l12_64.onnx --cls-names /var/lib/roadsense/models/mtsd_signcls_l12_classes.txt --dist-match-new 2.0 --lights-idle ZW.Z.W
+# Detection inputs for the tracker (chris-signs lane detin, docs/DETECTION_INPUTS.md; roadsense
+# docs/lanes/detin-detection-inputs.md) and the pose head (lane viewhead, docs/POSE_HEAD.md), installed 2026-11-24
+# (chris-integrator reads them with in_app, in_width, in_lamp_size, in_scale, in_pose_* on in /etc/chris/radar.json):
+# --lights-ru-emb yuv (model-free appearance vector yuv3x3; the learnt reid32 file stays off), --lights-ru-low 0.10
+# (low-score list road_users_low), --lights-ru-flags (trunc/occ), --lights-ru-view (sym, lamp pair in the dark),
+# --lights-ru-scale-lamps and --lights-ru-scale-multi 3 (scale rate from the lamp pair and 3 baselines),
+# --lights-ru-pose pose1-m64.onnx (heading and ground contact per vehicle box, contract pose1, at most 4 runs a pass;
+# the weights are private and installed by hand; without the file signd runs without pose). Phone bench 2026-11-24,
+# stack off, signd alone on replay (no modeld), warsaw-city at 10 min (busy day): light thread 103.5 -> 102.7 (detin)
+# -> 103.5 % of a big core (+ pose), lights 4.75 -> 4.76 fps, lights_ms 123.4 -> 122.8 -> 124.9, signs 4.94/s
+# unchanged, poses on 78 of 78 vehicle boxes; krakow-lights, krakow-night-tunnel and a1-night-fog alike within noise.
+ExecStart=/usr/local/bin/signd --det-backend ncnn --cls-backend ort --threads 2 --cpus 4-7 --max-hz 5 --gpu-sync turn --stats 10 --lights --lights-backend ncnn-cpu --lights-threads 2 --lights-cpus 4-7 --lights-hz 5 --lights-roi2 0.125,0.125,0.875,0.569 --lights-thr-keep 0.12 --lights-coast 3 --lights-road-users --lights-ru-scale --lights-state /var/lib/roadsense/models/lights_state_car_48x24.onnx,/var/lib/roadsense/models/lights_state_bdd_48x24.onnx --verifier /var/lib/roadsense/models/sign_verifier_32.onnx --class-min-score regulatory--no-entry=0.71 --cls /var/lib/roadsense/models/mtsd_signcls_l12_64.onnx --cls-names /var/lib/roadsense/models/mtsd_signcls_l12_classes.txt --dist-match-new 2.0 --lights-idle ZW.Z.W --lights-ru-emb yuv --lights-ru-low 0.10 --lights-ru-flags --lights-ru-view --lights-ru-scale-lamps --lights-ru-scale-multi 3 --lights-ru-pose /var/lib/roadsense/models/pose1-m64.onnx
 Restart=always
 RestartSec=2
 Nice=-5

@@ -54,7 +54,7 @@ if(NOT SIGND_ORT_INCLUDE_DIR OR NOT SIGND_ORT_LIBRARY)
 endif()
 
 add_library(signd_core STATIC signd/yolo.cc signd/ort_runner.cc signd/tracker.cc signd/output.cc signd/lights.cc
-  signd/scale.cc signd/verify.cc)
+  signd/scale.cc signd/detin.cc signd/pose.cc signd/verify.cc)
 target_include_directories(signd_core PUBLIC ${CMAKE_SOURCE_DIR}/signd ${ROADSENSE_DIR}/camerad
   ${SIGND_ORT_INCLUDE_DIR})
 target_link_libraries(signd_core PUBLIC ${SIGND_ORT_LIBRARY})
@@ -136,5 +136,14 @@ add_test(NAME road_users COMMAND road_users_test)
 add_executable(scale_rate_test tools/scale_rate_test.cc)
 target_link_libraries(scale_rate_test PRIVATE signd_core)
 add_test(NAME scale_rate COMMAND scale_rate_test)
+# Detection inputs for a tracker (signd/detin.h): flags, low-score list, view cues, embedding pooling; no model
+add_executable(detin_test tools/detin_test.cc)
+target_link_libraries(detin_test PRIVATE signd_core)
+add_test(NAME detin COMMAND detin_test)
+# Pose head machinery (signd/pose.h): crop, box numbers, decode and JSON against a stand-in model that is a fixed
+# linear map (tools/pose/make_fixture.py; no trained weights are needed to build or to test)
+add_executable(pose_test tools/pose_test.cc)
+target_link_libraries(pose_test PRIVATE signd_core)
+add_test(NAME pose COMMAND pose_test ${CMAKE_SOURCE_DIR}/tools/pose/pose_fixture.onnx)
 
 install(TARGETS signd signd_replay lights_replay RUNTIME DESTINATION bin)

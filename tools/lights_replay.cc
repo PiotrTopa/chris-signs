@@ -103,6 +103,15 @@ void usage() {
             "  --road-users  also decode the road users (signd --lights-road-users) into each message\n"
             "  --ru-scale    with --road-users: image scale change per road user (signd --lights-ru-scale)\n"
             "  --ru-scale-dt MIN,MAX  its baseline window in s (0.2,1.0)\n"
+            "  --ru-scale-multi N  baselines per box (1)   --ru-scale-lamps  lamp-pair rate in the dark\n"
+            "  --ru-scale-lamps-only  the lamp-pair rate without the patch alignment (evaluation)\n"
+            "  --ru-low X    with --road-users: the low-score list `road_users_low` (signd --lights-ru-low)\n"
+            "  --ru-flags    with --road-users: trunc / occ / occ_by / occ_edges per box (signd --lights-ru-flags)\n"
+            "  --ru-emb yuv|PATH.onnx  with --road-users: appearance vector per box (signd --lights-ru-emb)\n"
+            "  --ru-pose PATH.onnx  with --road-users: heading and ground points per box (signd --lights-ru-pose);\n"
+            "                --ru-pose-max N (4), --ru-pose-all, --ru-pose-cam F,CU,CV\n"
+            "  --ru-view     with --road-users: sym / lamps per vehicle box (signd --lights-ru-view)\n"
+            "  --ru-thr X    one score threshold for all eight road-user classes (evaluation)\n"
             "  --name-fps F  frame time from the JPEG file name: <number>.jpg = frame number at F frames/s (recorder\n"
             "                frames/<seq>.jpg, ride frames <index>.jpg at 20); default: --dt-ms per processed frame\n"
             "  --both     with --roi2: run both views on every frame (detections merged by NMS) instead of alternating\n"
@@ -160,6 +169,23 @@ int main(int argc, char **argv) {
         else if (a == "--dt-ms") dt_ms = atof(val().c_str());
         else if (a == "--name-fps") name_fps = atof(val().c_str());
         else if (a == "--ru-scale") lc.ru_scale = true;
+        else if (a == "--ru-scale-multi") lc.ru_scale = true, lc.ru_scale_multi = atoi(val().c_str());
+        else if (a == "--ru-scale-lamps") lc.ru_scale = lc.ru_scale_lamps = true;
+        else if (a == "--ru-scale-lamps-only") lc.ru_scale = lc.ru_scale_lamps = true, lc.ru_scale_patch = false;
+        else if (a == "--ru-low") lc.ru_thr_low = float(atof(val().c_str()));
+        else if (a == "--ru-flags") lc.ru_flags = true;
+        else if (a == "--ru-view") lc.ru_view = true;
+        else if (a == "--ru-emb") lc.ru_emb = val();
+        else if (a == "--ru-pose") lc.ru_pose = val();
+        else if (a == "--ru-pose-max") lc.ru_pose_max = atoi(val().c_str());
+        else if (a == "--ru-pose-all") lc.ru_pose_all = true;
+        else if (a == "--ru-pose-cam") {
+            if (sscanf(val().c_str(), "%f,%f,%f", &lc.ru_pose_cam[0], &lc.ru_pose_cam[1], &lc.ru_pose_cam[2]) != 3) return usage(), 2;
+        }
+        else if (a == "--ru-thr") {
+            const float x = float(atof(val().c_str()));
+            for (float &t : lc.ru_thr) t = x;
+        }
         else if (a == "--ru-scale-dt") {
             lc.ru_scale = true;
             if (!parse_floats(val(), lc.ru_scale_dt, 2)) return usage(), 2;
@@ -272,7 +298,8 @@ int main(int argc, char **argv) {
         if (track) tracker.update(seq, ts, dets, reps, seen);
         else reps.clear();
         printf("%s\n", lights_json(seq, ts, 0, t.total_ms, v.width, v.height, pipe->config(), reps, &dets, &t, view,
-                                    &pipe->road_users(), lc.road_users ? 1 : 0).c_str());
+                                    &pipe->road_users(), lc.road_users ? 1 : 0,
+                                    lc.ru_thr_low > 0 ? &pipe->road_users_low() : nullptr, pipe->emb_kind(), pipe->pose_kind()).c_str());
         t_users.push_back(t.users_ms);
         t_pre.push_back(t.pre_ms), t_det.push_back(t.det_ms), t_state.push_back(t.state_ms), t_total.push_back(t.total_ms);
     };

@@ -305,3 +305,7 @@ Reproduce: `lights_replay --backend ort --model bdd100k_yolo11n_320x960.onnx --r
 out.jsonl` (reject counts on stderr), then `tools/road_users/scale_check.py out.jsonl --road
 <rides-road>/<ride>.road.jsonl.gz`; recorder sessions: `--name-fps 19.47 --ru-scale-dt 0.2,1.6`, then
 `scale_check.py out.jsonl --session <session dir>`.
+
+Since 2026-11-24 the scale rate has two optional refinements for the dark (the lamp pair's separation as a second
+measurement, several baselines per box) and the road users carry further optional inputs for a tracker (a
+low-score list, occlusion / truncation flags, view cues, an appearance vector): [DETECTION_INPUTS.md](DETECTION_INPUTS.md).

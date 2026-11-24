@@ -217,6 +217,26 @@ void usage() {
             "                    an earlier light frame, 0.2-1 s back): optional scale_rate, scale_rate_std (1/s),\n"
             "                    scale_dt_s per box; --lights-ru-scale-max N boxes a pass (12, largest first),\n"
             "                    --lights-ru-scale-dt MIN,MAX baseline window in s (0.2,1.0; the oldest patch inside it)\n"
+            "  --lights-ru-scale-multi N  with --lights-ru-scale: up to N baselines per box (default 1: the oldest patch)\n"
+            "  --lights-ru-scale-lamps  with --lights-ru-scale: in the dark, the lamp pair's separation as a second\n"
+            "                    measurement (`scale_src` lamps / both)\n"
+            "  --lights-ru-low X  with --lights-road-users: boxes scoring above X but not above their class threshold are\n"
+            "                    listed as `road_users_low` (a tracker's second association stage: they may continue a\n"
+            "                    track, never start one); off by default\n"
+            "  --lights-ru-flags  with --lights-road-users: per box `trunc` (frame edges that cut it), `occ`, `occ_by`,\n"
+            "                    `occ_edges` (share covered by nearer boxes, by which one, which edges); off by default\n"
+            "  --lights-ru-emb yuv|PATH.onnx  with --lights-road-users: an appearance vector per box (`emb`; message key\n"
+            "                    `emb_kind`): yuv = model-free (3x3 cells of mean Y, Cb, Cr), a file = the learnt 32-number\n"
+            "                    embedding followed by the yuv numbers (one ORT run per box, --lights-ru-emb-max N boxes\n"
+            "                    a pass, 16)\n"
+            "  --lights-ru-pose PATH.onnx  with --lights-road-users: heading and ground contact points per vehicle box\n"
+            "                    from a trained head (`pose`; message key `pose_kind`; the model file comes from\n"
+            "                    chris-pose under its own licence, a missing file = off): one ORT run per box,\n"
+            "                    --lights-ru-pose-max N boxes a pass (4; more boxes take turns), --lights-ru-pose-all = also\n"
+            "                    persons and two-wheelers, --lights-ru-pose-cam F,CU,CV = the camera's focal length and\n"
+            "                    principal point in frame px (given to the head)\n"
+            "  --lights-ru-view  with --lights-road-users: view cues of vehicles from the box's pixels (no model): `sym`\n"
+            "                    (mirror symmetry), `lamps` (lamp pair in the dark: centroids, separation, colour)\n"
             "  --lights-thr X (0.25)  --lights-state rule|PATH.onnx[,PATH2.onnx...] (rule; of a list the first\n"
             "                    file that exists is used)  --lights-timing\n"
             "  --frames N        exit after N processed frames (testing)\n"
@@ -230,6 +250,7 @@ void usage() {
 }
 
 // --lights-ru-thr: "person=0.4,car=0.45" (names of road_user_name()) or eight numbers in class order.
+bool parse_floats(const std::string &s, float *out, int n);
 bool parse_ru_thr(const std::string &s, float *thr) {
     if (s.find('=') == std::string::npos) {
         float v[8];
@@ -312,6 +333,17 @@ void load_config(Options &o) {
     if (json_number(s, "lights_thr", &v)) o.lc.det_thr = float(v);
     if (json_number(s, "lights_road_users", &v)) o.lc.road_users = v != 0;
     if (json_number(s, "lights_ru_scale", &v)) o.lc.ru_scale = v != 0;
+    if (json_number(s, "lights_ru_low", &v)) o.lc.ru_thr_low = float(v);
+    if (json_number(s, "lights_ru_scale_multi", &v)) o.lc.ru_scale_multi = int(v);
+    if (json_number(s, "lights_ru_scale_lamps", &v)) o.lc.ru_scale_lamps = v != 0;
+    if (json_number(s, "lights_ru_flags", &v)) o.lc.ru_flags = v != 0;
+    if (json_number(s, "lights_ru_view", &v)) o.lc.ru_view = v != 0;
+    if (json_string(s, "lights_ru_emb", &str)) o.lc.ru_emb = str;
+    if (json_string(s, "lights_ru_pose", &str)) o.lc.ru_pose = str;
+    if (json_number(s, "lights_ru_pose_max", &v)) o.lc.ru_pose_max = int(v);
+    if (json_number(s, "lights_ru_pose_all", &v)) o.lc.ru_pose_all = v != 0;
+    if (json_string(s, "lights_ru_pose_cam", &str) && !parse_floats(str, o.lc.ru_pose_cam, 3))
+        fprintf(stderr, "signd: bad lights_ru_pose_cam in signd.json\n");
     if (json_string(s, "lights_ru_thr", &str) && !parse_ru_thr(str, o.lc.ru_thr))
         fprintf(stderr, "signd: bad lights_ru_thr in signd.json\n");
 }
@@ -411,6 +443,19 @@ int main(int argc, char **argv) {
             if (!parse_floats(val(), opt.lc.ru_roi, 4)) return usage(), 2;
         } else if (a == "--lights-ru-hz") opt.lc.ru_hz = atof(val().c_str());
         else if (a == "--lights-ru-scale") opt.lc.ru_scale = true;
+        else if (a == "--lights-ru-scale-multi") opt.lc.ru_scale = true, opt.lc.ru_scale_multi = atoi(val().c_str());
+        else if (a == "--lights-ru-scale-lamps") opt.lc.ru_scale = opt.lc.ru_scale_lamps = true;
+        else if (a == "--lights-ru-low") opt.lc.ru_thr_low = float(atof(val().c_str()));
+        else if (a == "--lights-ru-flags") opt.lc.ru_flags = true;
+        else if (a == "--lights-ru-view") opt.lc.ru_view = true;
+        else if (a == "--lights-ru-emb") opt.lc.ru_emb = val();
+        else if (a == "--lights-ru-emb-max") opt.lc.ru_emb_max = atoi(val().c_str());
+        else if (a == "--lights-ru-pose") opt.lc.ru_pose = val();
+        else if (a == "--lights-ru-pose-max") opt.lc.ru_pose_max = atoi(val().c_str());
+        else if (a == "--lights-ru-pose-all") opt.lc.ru_pose_all = true;
+        else if (a == "--lights-ru-pose-cam") {
+            if (!parse_floats(val(), opt.lc.ru_pose_cam, 3)) return usage(), 2;
+        }
         else if (a == "--lights-ru-scale-max") opt.lc.ru_scale = true, opt.lc.ru_scale_max = atoi(val().c_str());
         else if (a == "--lights-ru-scale-dt") {
             opt.lc.ru_scale = true;
@@ -667,7 +712,8 @@ int main(int argc, char **argv) {
             const double ms = t.total_ms + std::chrono::duration<double, std::milli>(Clock::now() - tt0).count();
             std::string lmsg = lights_json(lf.seq, lf.ts_mono_ns, lf.ts_real_ns, ms, v.width, v.height, lp->config(), lrep,
                                            opt.lights_timing ? &ld : nullptr, opt.lights_timing ? &t : nullptr, view,
-                                           &lp->road_users(), users_state);
+                                           &lp->road_users(), users_state,
+                                           opt.lc.ru_thr_low > 0 ? &lp->road_users_low() : nullptr, lp->emb_kind(), lp->pose_kind());
             // still nothing tracked after this pass and the pattern allowed: the next periods follow the pattern,
             // and the message says so (consumers judge the stream's rate by it)
             if (!opt.lights_idle.empty() && lt.live() == 0 && l_demand.cap("lights_idle") != 0)
@@ -699,7 +745,8 @@ int main(int argc, char **argv) {
                         lp->process(v, none, &t3, 2);
                         lp->measure_scale(v, lf.ts_mono_ns, &t3);
                         lsrv.publish(road_users_json(lf.seq, lf.ts_mono_ns, lf.ts_real_ns, t3.total_ms, v.width, v.height,
-                                                     lp->view_roi(2), lp->road_users()));
+                                                     lp->view_roi(2), lp->road_users(),
+                                                     opt.lc.ru_thr_low > 0 ? &lp->road_users_low() : nullptr, lp->emb_kind(), lp->pose_kind()));
                         ru_ms += t3.total_ms, ++ru_n;
                     } catch (const std::exception &e) {
                         fprintf(stderr, "signd: road-user view failed: %s\n", e.what());

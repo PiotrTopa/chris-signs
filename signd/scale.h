@@ -115,6 +115,7 @@ private:
         int w, h;
         bool edge;         // box touches the frame edge (no template)
         int clip;          // RoadUserDet::clip (edges of the view's region the box touches)
+        bool low = false;  // from the low-score list: a sloppier box, a template only where the window has no other
         bool lamp = false; // the box had a lamp pair
         float lsep = 0, lsep_std = 0;
         int lcol = 0;

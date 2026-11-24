@@ -372,6 +372,7 @@ void ScaleRateEstimator::update(const Nv12View &f, int64_t ts, std::vector<RoadU
         e.cx = (u.x0 + u.x1) * 0.5, e.cy = (u.y0 + u.y1) * 0.5;
         e.edge = u.x0 <= 1.f || u.y0 <= 1.f || u.x1 >= f.width - 1.f || u.y1 >= f.height - 1.f;
         e.clip = u.clip;
+        e.low = is_low;
         if (cfg_.lamps && u.lamps.ok) e.lamp = true, e.lsep = u.lamps.sep, e.lsep_std = u.lamps.sep_std, e.lcol = u.lamps.colour;
         const double iw = (u.x1 - u.x0) * cfg_.inner_frac, ih = (u.y1 - u.y0) * cfg_.inner_frac;
         // about patch_px^2 template pixels whatever the aspect (a fixed long side would leave a flat box, e.g. a near
@@ -433,6 +434,11 @@ void ScaleRateEstimator::update(const Nv12View &f, int64_t ts, std::vector<RoadU
                 if (dt > cfg_.max_dt_s || dt < cfg_.min_dt_s || o.tpl.empty() || o.edge) continue;
                 tp.push_back(&o);
             }
+            // A low-score box is a poor template (its edges are 2-3 times as far off, so the scale prior and the
+            // search window sit wrong): where the window holds first-list patches, only those are baselines.
+            // (Measured: with low boxes as templates the a1-night-fog ride lost 11 of 162 values.)
+            if (std::any_of(tp.begin(), tp.end(), [](const Entry *o) { return !o->low; }))
+                tp.erase(std::remove_if(tp.begin(), tp.end(), [](const Entry *o) { return o->low; }), tp.end());
             if (!tp.empty()) {
                 const ScaleResult r0 = align(tp[0], &why);
                 if (cfg_.baselines <= 1 || tp.size() == 1) {

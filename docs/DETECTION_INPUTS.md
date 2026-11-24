@@ -23,6 +23,7 @@ default configuration.
 | `--lights-ru-emb FILE.onnx` | the same, with a small learnt part | 0.63 ms per box (one ORT run), at most 16 boxes a pass |
 | `--lights-ru-scale-lamps` | `scale_src` (and more boxes with `scale_rate`) | 0.03-0.17 ms per box with a lamp pair (dark frames only) |
 | `--lights-ru-scale-multi N` | (more boxes with `scale_rate`) | the patch alignment x 2.5 at N = 3 |
+| `--lights-ru-pose FILE.onnx` | `pose`, message key `pose_kind` ([POSE_HEAD.md](POSE_HEAD.md)) | one ORT run per box (about 1.5 ms on the loaded laptop), at most 4 boxes a pass |
 
 ## 1. The low-score list (`--lights-ru-low X`)
 
@@ -359,6 +360,12 @@ second instead of 3-5 and make the robust fit robust. Designed, not built (the l
 pass today).
 
 ## 6. Orientation and ground contact: what the present model gives, and what would be needed
+
+**Since 2026-11-24 (lane `viewhead`) the trained head sketched below exists**: `--lights-ru-pose FILE.onnx`,
+[POSE_HEAD.md](POSE_HEAD.md) (heading with a calibrated uncertainty, the footprint's ground points, also for a
+box whose bottom is cut or covered). It is trained on KITTI in the separate project chris-pose and loaded at
+run time; this repository holds the machinery only. What follows is the state before it, kept as the reasoning
+that led there.
 
 The detector's output is a box and ten class scores. From it and the pixels, without training:
 * which end faces the camera, in the dark (`lamps.c`);
